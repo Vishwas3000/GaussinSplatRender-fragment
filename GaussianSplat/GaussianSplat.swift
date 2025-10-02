@@ -3,56 +3,184 @@ import simd
 
 struct GaussianSplat {
     let position: SIMD3<Float>
-    let scale: SIMD3<Float>
-    let rotation: simd_quatf
-    let opacity: Float
-    let color: SIMD3<Float>
-    let sphericalHarmonics: [Float]?
+    let covariance3D: SIMD4<Float> // Store 3D covariance as packed data: [xx, xy, xz, yy]
+    let covariance3D_B: SIMD2<Float> // Store remaining elements: [yz, zz]
+    let color: SIMD3<UInt8>
+    let opacity: UInt8
+    let depth: Float
     
     init(position: SIMD3<Float>, 
-         scale: SIMD3<Float>, 
-         rotation: simd_quatf, 
-         opacity: Float, 
+         covariance3D: simd_float3x3,
          color: SIMD3<Float>, 
-         sphericalHarmonics: [Float]? = nil) {
+         opacity: Float,
+         depth: Float) {
         self.position = position
-        self.scale = scale
-        self.rotation = rotation
-        self.opacity = Swift.min(Swift.max(opacity, 0.0), 1.0)
-        self.color = color
-        self.sphericalHarmonics = sphericalHarmonics
+        
+        // Pack 3x3 covariance matrix efficiently
+        // Σ = [xx xy xz]  ->  covariance3D = [xx, xy, xz, yy]
+        //     [xy yy yz]      covariance3D_B = [yz, zz]
+        //     [xz yz zz]
+        self.covariance3D = SIMD4<Float>(
+            covariance3D[0][0], // xx
+            covariance3D[0][1], // xy
+            covariance3D[0][2], // xz
+            covariance3D[1][1]  // yy
+        )
+        self.covariance3D_B = SIMD2<Float>(
+            covariance3D[1][2], // yz
+            covariance3D[2][2]  // zz
+        )
+        
+        // Convert to 8-bit color
+        self.color = SIMD3<UInt8>(
+            UInt8(clamp(color.x * 255.0, 0.0, 255.0)),
+            UInt8(clamp(color.y * 255.0, 0.0, 255.0)),
+            UInt8(clamp(color.z * 255.0, 0.0, 255.0))
+        )
+        
+        self.opacity = UInt8(clamp(opacity * 255.0, 0.0, 255.0))
+        self.depth = depth
     }
     
-    var boundingBox: (min: SIMD3<Float>, max: SIMD3<Float>) {
-        let halfScale = scale * 0.5
-        return (
-            min: position - halfScale,
-            max: position + halfScale
+    var floatColor: SIMD3<Float> {
+        return SIMD3<Float>(
+            Float(color.x) / 255.0,
+            Float(color.y) / 255.0,
+            Float(color.z) / 255.0
         )
     }
     
-    var memorySize: Int {
-        let baseSize = MemoryLayout<SIMD3<Float>>.size * 3 + 
-                      MemoryLayout<simd_quatf>.size + 
-                      MemoryLayout<Float>.size
-        let shSize = sphericalHarmonics?.count ?? 0
-        return baseSize + (shSize * MemoryLayout<Float>.size)
+    var floatOpacity: Float {
+        return Float(opacity) / 255.0
+    }
+    
+    var covariance3DMatrix: simd_float3x3 {
+        return simd_float3x3(
+            SIMD3<Float>(covariance3D.x, covariance3D.y, covariance3D.z), // [xx, xy, xz]
+            SIMD3<Float>(covariance3D.y, covariance3D.w, covariance3D_B.x), // [xy, yy, yz]
+            SIMD3<Float>(covariance3D.z, covariance3D_B.x, covariance3D_B.y)  // [xz, yz, zz]
+        )
+    }
+    
+    static var stride: Int {
+        return MemoryLayout<GaussianSplat>.stride
     }
 }
 
-extension GaussianSplat: Equatable {
-    static func == (lhs: GaussianSplat, rhs: GaussianSplat) -> Bool {
-        return lhs.position == rhs.position &&
-               lhs.scale == rhs.scale &&
-               lhs.rotation.vector == rhs.rotation.vector &&
-               lhs.opacity == rhs.opacity &&
-               lhs.color == rhs.color &&
-               lhs.sphericalHarmonics == rhs.sphericalHarmonics
+struct TileData {
+    var count: UInt32
+    var padding: (UInt32, UInt32, UInt32) // Align to 16 bytes
+    
+    init() {
+        self.count = 0
+        self.padding = (0, 0, 0)
     }
 }
 
-extension GaussianSplat: CustomStringConvertible {
-    var description: String {
-        return "GaussianSplat(pos: \(position), scale: \(scale), rot: \(rotation), opacity: \(opacity), color: \(color))"
+struct ViewUniforms {
+    let viewMatrix: simd_float4x4
+    let projectionMatrix: simd_float4x4
+    let viewProjectionMatrix: simd_float4x4
+    let cameraPosition: SIMD3<Float>
+    let time: Float
+    let screenSize: SIMD2<Float>
+    let padding: SIMD2<Float>
+    
+    init(viewMatrix: simd_float4x4, 
+         projectionMatrix: simd_float4x4, 
+         cameraPosition: SIMD3<Float>, 
+         screenSize: SIMD2<Float>, 
+         time: Float = 0) {
+        self.viewMatrix = viewMatrix
+        self.projectionMatrix = projectionMatrix
+        self.viewProjectionMatrix = projectionMatrix * viewMatrix
+        self.cameraPosition = cameraPosition
+        self.time = time
+        self.screenSize = screenSize
+        self.padding = SIMD2<Float>(0, 0)
     }
+}
+
+struct TileUniforms {
+    let tilesPerRow: UInt32
+    let tilesPerColumn: UInt32
+    let tileSize: UInt32
+    let maxSplatsPerTile: UInt32
+    
+    init(screenWidth: Int, screenHeight: Int, tileSize: Int = 16) {
+        self.tileSize = UInt32(tileSize)
+        self.tilesPerRow = UInt32((screenWidth + tileSize - 1) / tileSize)
+        self.tilesPerColumn = UInt32((screenHeight + tileSize - 1) / tileSize)
+        self.maxSplatsPerTile = 64 // Reduced for stability
+    }
+    
+    var totalTiles: Int {
+        return Int(tilesPerRow * tilesPerColumn)
+    }
+}
+
+extension GaussianSplat: Comparable {
+    static func < (lhs: GaussianSplat, rhs: GaussianSplat) -> Bool {
+        return lhs.depth > rhs.depth // Sort back-to-front for alpha blending
+    }
+}
+
+// Helper functions for matrix operations
+func clamp<T: Comparable>(_ value: T, _ min: T, _ max: T) -> T {
+    return Swift.max(min, Swift.min(max, value))
+}
+
+func createRandom3DCovariance(scale: Float = 1.0) -> simd_float3x3 {
+    // Generate random 3D rotation using Euler angles
+    let rotX = Float.random(in: 0...(2 * Float.pi))
+    let rotY = Float.random(in: 0...(2 * Float.pi))
+    let rotZ = Float.random(in: 0...(2 * Float.pi))
+    
+    // Create rotation matrices for each axis
+    let cosX = cos(rotX), sinX = sin(rotX)
+    let cosY = cos(rotY), sinY = sin(rotY)
+    let cosZ = cos(rotZ), sinZ = sin(rotZ)
+    
+    let rotationX = simd_float3x3(
+        SIMD3<Float>(1, 0, 0),
+        SIMD3<Float>(0, cosX, -sinX),
+        SIMD3<Float>(0, sinX, cosX)
+    )
+    
+    let rotationY = simd_float3x3(
+        SIMD3<Float>(cosY, 0, sinY),
+        SIMD3<Float>(0, 1, 0),
+        SIMD3<Float>(-sinY, 0, cosY)
+    )
+    
+    let rotationZ = simd_float3x3(
+        SIMD3<Float>(cosZ, -sinZ, 0),
+        SIMD3<Float>(sinZ, cosZ, 0),
+        SIMD3<Float>(0, 0, 1)
+    )
+    
+    // Combine rotations: R = Rz * Ry * Rx
+    let rotation = rotationZ * rotationY * rotationX
+    
+    // Create 3D scale matrix with dramatic variations
+    let baseScale = max(0.1, scale)
+    let scaleX = Float.random(in: 0.05...baseScale * 3.0)
+    let scaleY = Float.random(in: 0.05...baseScale * 3.0)
+    let scaleZ = Float.random(in: 0.05...baseScale * 3.0)
+    
+    // Sometimes create very elongated splats in any direction (30% chance)
+    let elongationFactor = Float.random(in: 0.1...8.0)
+    let finalScaleX = scaleX * (Float.random(in: 0...1) < 0.3 ? elongationFactor : 1.0)
+    let finalScaleY = scaleY * (Float.random(in: 0...1) < 0.3 ? elongationFactor : 1.0)
+    let finalScaleZ = scaleZ * (Float.random(in: 0...1) < 0.3 ? elongationFactor : 1.0)
+    
+    let scaleMatrix = simd_float3x3(
+        SIMD3<Float>(finalScaleX, 0, 0),
+        SIMD3<Float>(0, finalScaleY, 0),
+        SIMD3<Float>(0, 0, finalScaleZ)
+    )
+    
+    // Combine: R * S * R^T to create 3D covariance matrix
+    let temp = rotation * scaleMatrix
+    return temp * rotation.transpose
 }
