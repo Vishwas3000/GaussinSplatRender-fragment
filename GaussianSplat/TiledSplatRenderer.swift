@@ -16,18 +16,24 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     
-    // Compute pipeline for tile culling
+    // Compute pipelines
+    private var clearTilesPipeline: MTLComputePipelineState!
     private var tileCullingPipeline: MTLComputePipelineState!
-    
+    private var finalizeTileCountsPipeline: MTLComputePipelineState!
+
     // Render pipeline for fullscreen pass
     private var renderPipeline: MTLRenderPipelineState!
-    
-    // Debug pipeline for visualizing tiles
+
+    // Debug pipelines for visualizing tiles
     private var debugPipeline: MTLRenderPipelineState!
-    
+    private var debugHeatmapPipeline: MTLRenderPipelineState!
+    private var debugWorkloadPipeline: MTLRenderPipelineState!
+    private var debugCullingPipeline: MTLRenderPipelineState!
+
     // Buffers
     private var splatBuffer: MTLBuffer!
     private var tileBuffer: MTLBuffer!
+    private var tileCountsAtomicBuffer: MTLBuffer!  // Atomic counters for thread-safe tile updates
     private var viewUniformsBuffer: MTLBuffer!
     private var tileUniformsBuffer: MTLBuffer!
     private var splatCountBuffer: MTLBuffer!
@@ -67,6 +73,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         case hudOnly = 2
         case fullDebug = 3
         case trailOnly = 4
+        case tileHeatmap = 5
+        case tileBoundaries = 6
+        case splatAssignment = 7
+        case cullingStats = 8
         
         var description: String {
             switch self {
@@ -75,6 +85,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             case .hudOnly: return "HUD Only"
             case .fullDebug: return "Full Debug"
             case .trailOnly: return "Trail Only"
+            case .tileHeatmap: return "Tile Heatmap"
+            case .tileBoundaries: return "Tile Boundaries"
+            case .splatAssignment: return "Splat Assignment"
+            case .cullingStats: return "Culling Stats"
             }
         }
     }
@@ -95,15 +109,37 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             fatalError("Could not create Metal library")
         }
         
-        // Setup compute pipeline for tile culling
+        // Setup compute pipeline for clearing tiles
+        guard let clearTilesFunction = library.makeFunction(name: "clearTiles") else {
+            fatalError("Could not find clearTiles function")
+        }
+
+        do {
+            clearTilesPipeline = try device.makeComputePipelineState(function: clearTilesFunction)
+        } catch {
+            fatalError("Could not create clear tiles pipeline: \(error)")
+        }
+
+        // Setup compute pipeline for tile culling (splat-centric with atomics)
         guard let tileCullingFunction = library.makeFunction(name: "buildTiles") else {
             fatalError("Could not find buildTiles function")
         }
-        
+
         do {
             tileCullingPipeline = try device.makeComputePipelineState(function: tileCullingFunction)
         } catch {
             fatalError("Could not create tile culling pipeline: \(error)")
+        }
+
+        // Setup compute pipeline for finalizing tile counts
+        guard let finalizeCountsFunction = library.makeFunction(name: "finalizeTileCounts") else {
+            fatalError("Could not find finalizeTileCounts function")
+        }
+
+        do {
+            finalizeTileCountsPipeline = try device.makeComputePipelineState(function: finalizeCountsFunction)
+        } catch {
+            fatalError("Could not create finalize tile counts pipeline: \(error)")
         }
         
         // Setup render pipeline for fullscreen pass
@@ -148,8 +184,70 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             fatalError("Could not create debug pipeline: \(error)")
         }
         
+        // Setup enhanced debug pipelines for tile visualization
+        setupDebugTilePipelines(library: library, vertexFunction: vertexFunction)
+
         // Setup debug line rendering pipeline
         setupDebugLinePipeline(library: library)
+    }
+    
+    private func setupDebugTilePipelines(library: MTLLibrary, vertexFunction: MTLFunction) {
+        // Debug tile heatmap pipeline
+        if let heatmapFunction = library.makeFunction(name: "debugTileHeatmapFragment") {
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = vertexFunction
+            descriptor.fragmentFunction = heatmapFunction
+            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            descriptor.colorAttachments[0].isBlendingEnabled = true
+            descriptor.colorAttachments[0].rgbBlendOperation = .add
+            descriptor.colorAttachments[0].alphaBlendOperation = .add
+            descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            
+            do {
+                debugHeatmapPipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+            } catch {
+                print("Warning: Could not create debug heatmap pipeline: \(error)")
+            }
+        }
+        
+        // Debug workload pipeline
+        if let workloadFunction = library.makeFunction(name: "debugTileWorkloadFragment") {
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = vertexFunction
+            descriptor.fragmentFunction = workloadFunction
+            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            descriptor.colorAttachments[0].isBlendingEnabled = true
+            descriptor.colorAttachments[0].rgbBlendOperation = .add
+            descriptor.colorAttachments[0].alphaBlendOperation = .add
+            descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            
+            do {
+                debugWorkloadPipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+            } catch {
+                print("Warning: Could not create debug workload pipeline: \(error)")
+            }
+        }
+        
+        // Debug culling efficiency pipeline  
+        if let cullingFunction = library.makeFunction(name: "debugTileCullingFragment") {
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = vertexFunction
+            descriptor.fragmentFunction = cullingFunction
+            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            descriptor.colorAttachments[0].isBlendingEnabled = true
+            descriptor.colorAttachments[0].rgbBlendOperation = .add
+            descriptor.colorAttachments[0].alphaBlendOperation = .add
+            descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            
+            do {
+                debugCullingPipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+            } catch {
+                print("Warning: Could not create debug culling pipeline: \(error)")
+            }
+        }
     }
     
     private func setupDebugLinePipeline(library: MTLLibrary) {
@@ -263,9 +361,9 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let projectionMatrix = createProjectionMatrix(aspect: 1.0) // Will be updated in draw
         
         // Calculate proportional counts based on maxSplatCount
-        let scatteredCount = min(Int(Float(maxSplatCount) * 0.4), 2000) // 40% for scattered
-        let sphereCount = min(Int(Float(maxSplatCount) * 0.08), 100)    // 8% per sphere (5 spheres = 40%)
-        let clusterCount = min(Int(Float(maxSplatCount) * 0.05), 60)    // 5% per cluster (4 clusters = 20%)
+        let scatteredCount = Int(Float(maxSplatCount) * 0.4)  // 40% for scattered cloud
+        let sphereCount = Int(Float(maxSplatCount) * 0.08)    // 8% per sphere (3 spheres = 24%)
+        let clusterCount = Int(Float(maxSplatCount) * 0.18)   // 18% per cluster (2 clusters = 36%)
         
         // 1. Large scattered cloud in wide area
         let scatteredCloud = GaussianSplatGenerator.generateRandomSplats(
@@ -407,7 +505,11 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         // Create tile buffer (each tile can hold up to maxSplatsPerTile indices)
         let tileDataSize = tileUniforms.totalTiles * MemoryLayout<TileData>.stride
         tileBuffer = device.makeBuffer(length: tileDataSize, options: .storageModeShared)
-        
+
+        // Create atomic counter buffer (one uint32 counter per tile)
+        let atomicBufferSize = tileUniforms.totalTiles * MemoryLayout<UInt32>.stride
+        tileCountsAtomicBuffer = device.makeBuffer(length: atomicBufferSize, options: .storageModeShared)
+
         // Clear tile buffer
         let tilePtr = tileBuffer.contents().bindMemory(to: TileData.self, capacity: tileUniforms.totalTiles)
         for i in 0..<tileUniforms.totalTiles {
@@ -502,49 +604,123 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let viewUniformsPtr = viewUniformsBuffer.contents().bindMemory(to: ViewUniforms.self, capacity: 1)
         viewUniformsPtr[0] = viewUniforms
         
-        // Phase 1: Tile Culling Compute Pass - DISABLED FOR TESTING
-        // TODO: Re-enable once basic rendering works
-        /*
+        // Phase 1a: Clear Tiles Compute Pass
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
-            computeEncoder.setComputePipelineState(tileCullingPipeline)
-            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(tileBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 2)
-            computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 3)
-            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 4)
-            
-            let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
+            computeEncoder.setComputePipelineState(clearTilesPipeline)
+            computeEncoder.setBuffer(tileBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 1)
+
+            // Dispatch one thread per tile (1D grid)
+            let totalTiles = tileUniforms.totalTiles
+            let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
             let threadgroupsPerGrid = MTLSize(
-                width: (Int(tileUniforms.tilesPerRow) + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
-                height: (Int(tileUniforms.tilesPerColumn) + threadsPerThreadgroup.height - 1) / threadsPerThreadgroup.height,
+                width: (totalTiles + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+                height: 1,
                 depth: 1
             )
-            
+
             computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
             computeEncoder.endEncoding()
         }
-        */
-        
+
+        // Clear atomic counters
+        if let atomicPtr = tileCountsAtomicBuffer?.contents().bindMemory(to: UInt32.self, capacity: tileUniforms.totalTiles) {
+            for i in 0..<tileUniforms.totalTiles {
+                atomicPtr[i] = 0
+            }
+        }
+
+        // Phase 1b: Build Tiles - Splat-Centric Compute Pass with Atomics
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(tileCullingPipeline)
+            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(tileCountsAtomicBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(tileBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 3)
+            computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 4)
+            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 5)
+
+            // Dispatch one thread per splat (1D grid)
+            let splatCount = splats.count
+            let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
+            let threadgroupsPerGrid = MTLSize(
+                width: (splatCount + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+                height: 1,
+                depth: 1
+            )
+
+            computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
+        }
+
+        // Phase 1c: Finalize Tile Counts (copy atomic counts to TileData)
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(finalizeTileCountsPipeline)
+            computeEncoder.setBuffer(tileCountsAtomicBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(tileBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 2)
+
+            // Dispatch one thread per tile
+            let totalTiles = tileUniforms.totalTiles
+            let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
+            let threadgroupsPerGrid = MTLSize(
+                width: (totalTiles + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+                height: 1,
+                depth: 1
+            )
+
+            computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
+        }
+
         // Phase 2: Fullscreen Rendering Pass
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
         
         if let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
-            if showDebugTiles {
+            // Select appropriate pipeline based on debug mode
+            switch cameraDebugMode {
+            case .tileHeatmap:
+                // Use enhanced heatmap visualization
+                if let heatmapPipeline = debugHeatmapPipeline {
+                    renderEncoder.setRenderPipelineState(heatmapPipeline)
+                } else {
+                    renderEncoder.setRenderPipelineState(debugPipeline)
+                }
+            case .splatAssignment:
+                // Use workload visualization
+                if let workloadPipeline = debugWorkloadPipeline {
+                    renderEncoder.setRenderPipelineState(workloadPipeline)
+                } else {
+                    renderEncoder.setRenderPipelineState(debugPipeline)
+                }
+            case .cullingStats:
+                // Use culling efficiency visualization
+                if let cullingPipeline = debugCullingPipeline {
+                    renderEncoder.setRenderPipelineState(cullingPipeline)
+                } else {
+                    renderEncoder.setRenderPipelineState(debugPipeline)
+                }
+            case .tileBoundaries:
+                // Use standard debug pipeline (shows basic tiles)
                 renderEncoder.setRenderPipelineState(debugPipeline)
-            } else {
-                renderEncoder.setRenderPipelineState(renderPipeline)
+            default:
+                if showDebugTiles {
+                    renderEncoder.setRenderPipelineState(debugPipeline)
+                } else {
+                    renderEncoder.setRenderPipelineState(renderPipeline)
+                }
             }
-            
+
             renderEncoder.setFragmentBuffer(splatBuffer, offset: 0, index: 0)
             renderEncoder.setFragmentBuffer(tileBuffer, offset: 0, index: 1)
             renderEncoder.setFragmentBuffer(viewUniformsBuffer, offset: 0, index: 2)
             renderEncoder.setFragmentBuffer(tileUniformsBuffer, offset: 0, index: 3)
             renderEncoder.setFragmentBuffer(splatCountBuffer, offset: 0, index: 4)
-            
+
             // Draw fullscreen triangle
             renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            
+
             renderEncoder.endEncoding()
         }
         
@@ -684,8 +860,8 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let azimuthDegrees = cameraAzimuth * 180.0 / Float.pi
         let elevationDegrees = cameraElevation * 180.0 / Float.pi
         
-        return """
-        Debug Mode: \(cameraDebugMode)
+        var info = """
+        Debug Mode: \(cameraDebugMode.description)
         Camera Position: (\(String(format: "%.2f", cameraPosition.x)), \(String(format: "%.2f", cameraPosition.y)), \(String(format: "%.2f", cameraPosition.z)))
         Camera Target: (\(String(format: "%.2f", cameraTarget.x)), \(String(format: "%.2f", cameraTarget.y)), \(String(format: "%.2f", cameraTarget.z)))
         Distance: \(String(format: "%.2f", cameraDistance))
@@ -693,6 +869,98 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         Elevation: \(String(format: "%.1f", elevationDegrees))°
         Trail Points: \(cameraTrail.count)
         Splats: \(splats.count)
+        """
+        
+        // Add tile performance information for tile visualization modes
+        if cameraDebugMode == .tileHeatmap ||
+           cameraDebugMode == .tileBoundaries ||
+           cameraDebugMode == .splatAssignment ||
+           cameraDebugMode == .cullingStats {
+            info += "\n" + getTilePerformanceInfo()
+            info += "\n" + getVisualizationGuide()
+        }
+        
+        return info
+    }
+    
+    private func getVisualizationGuide() -> String {
+        switch cameraDebugMode {
+        case .tileHeatmap:
+            return """
+
+            Heatmap Color Guide:
+            Black → Blue → Cyan → Yellow → Red
+            (0 splats) → (max splats: \(tileUniforms.maxSplatsPerTile))
+            White borders = Tiles at max capacity
+            """
+        case .splatAssignment:
+            return """
+
+            Workload Visualization:
+            Vertical bars show GPU workload per tile
+            Red borders = High workload (>80%)
+            Color intensity = Computational complexity
+            """
+        case .cullingStats:
+            return """
+
+            Culling Efficiency:
+            Green = Accepted splats
+            Red = Rejected (culled) splats
+            Blue = Culling effectiveness
+            White line = Accept/Reject ratio
+            """
+        case .tileBoundaries:
+            return """
+
+            Tile Boundaries:
+            Shows basic tile grid structure
+            Each tile: 16x16 pixels
+            """
+        default:
+            return ""
+        }
+    }
+
+    private func getTilePerformanceInfo() -> String {
+        guard let tileBuffer = tileBuffer else { return "" }
+
+        let tilePtr = tileBuffer.contents().bindMemory(to: TileData.self, capacity: tileUniforms.totalTiles)
+        var totalSplats: UInt32 = 0
+        var totalRejected: UInt32 = 0
+        var totalWorkload: UInt32 = 0
+        var activeTiles = 0
+        var maxedOutTiles = 0
+
+        for i in 0..<tileUniforms.totalTiles {
+            let tile = tilePtr[i]
+            totalSplats += tile.count
+            totalRejected += tile.rejectedCount
+            totalWorkload += tile.workloadEstimate
+            
+            if tile.count > 0 || tile.rejectedCount > 0 {
+                activeTiles += 1
+            }
+            if tile.count >= tileUniforms.maxSplatsPerTile {
+                maxedOutTiles += 1
+            }
+        }
+
+        let totalProcessed = totalSplats + totalRejected
+        let cullingEfficiency = totalProcessed > 0 ? Float(totalRejected) / Float(totalProcessed) * 100.0 : 0.0
+        let avgSplatsPerActiveTile = activeTiles > 0 ? Float(totalSplats) / Float(activeTiles) : 0.0
+
+        return """
+
+        Tile Performance:
+        Total Tiles: \(tileUniforms.totalTiles)
+        Active Tiles: \(activeTiles) (\(String(format: "%.1f", Float(activeTiles) / Float(tileUniforms.totalTiles) * 100.0))%)
+        Maxed Out Tiles: \(maxedOutTiles)
+        Assigned Splats: \(totalSplats)
+        Rejected Splats: \(totalRejected)
+        Avg Splats/Active Tile: \(String(format: "%.1f", avgSplatsPerActiveTile))
+        Culling Efficiency: \(String(format: "%.1f", cullingEfficiency))%
+        Total Workload: \(totalWorkload)
         """
     }
     

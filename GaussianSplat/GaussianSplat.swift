@@ -68,12 +68,32 @@ struct GaussianSplat {
 }
 
 struct TileData {
-    var count: UInt32
-    var padding: (UInt32, UInt32, UInt32) // Align to 16 bytes
-    
+    var count: UInt32           // Number of splats assigned to this tile
+    var rejectedCount: UInt32   // Number of splats rejected (culled) from this tile
+    var workloadEstimate: UInt32 // Estimated GPU workload (for performance visualization)
+    var maxDepth: UInt32        // Maximum depth of splats in this tile (for debugging)
+    var splatIndices: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32) // Array of splat indices (64 elements)
+
     init() {
         self.count = 0
-        self.padding = (0, 0, 0)
+        self.rejectedCount = 0
+        self.workloadEstimate = 0
+        self.maxDepth = 0
+        self.splatIndices = (0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0)
     }
 }
 
@@ -111,7 +131,7 @@ struct TileUniforms {
         self.tileSize = UInt32(tileSize)
         self.tilesPerRow = UInt32((screenWidth + tileSize - 1) / tileSize)
         self.tilesPerColumn = UInt32((screenHeight + tileSize - 1) / tileSize)
-        self.maxSplatsPerTile = 64 // Reduced for stability
+        self.maxSplatsPerTile = 64 // Matches TileData splatIndices array size
     }
     
     var totalTiles: Int {

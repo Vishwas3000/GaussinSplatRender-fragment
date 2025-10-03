@@ -15,7 +15,7 @@ struct MetalView: UIViewRepresentable {
         metalView.clearColor = MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
         
         let renderer = TiledSplatRenderer(device: device)
-        renderer.setMaxSplatCount(2000000) // 2 million splats
+        renderer.setMaxSplatCount(2000)
         metalView.delegate = renderer
         
         context.coordinator.renderer = renderer
