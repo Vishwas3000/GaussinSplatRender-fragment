@@ -16,10 +16,13 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     
-    // Compute pipelines
+    // Compute pipelines - Optimized Morton Code + Radix Sort
+    private var mortonCodePipeline: MTLComputePipelineState!
+    private var radixSortCountPipeline: MTLComputePipelineState!
+    private var radixSortScanPipeline: MTLComputePipelineState!
+    private var radixSortScatterPipeline: MTLComputePipelineState!
     private var clearTilesPipeline: MTLComputePipelineState!
-    private var tileCullingPipeline: MTLComputePipelineState!
-    private var finalizeTileCountsPipeline: MTLComputePipelineState!
+    private var buildTilesOptimizedPipeline: MTLComputePipelineState!
 
     // Render pipeline for fullscreen pass
     private var renderPipeline: MTLRenderPipelineState!
@@ -33,10 +36,17 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     // Buffers
     private var splatBuffer: MTLBuffer!
     private var tileBuffer: MTLBuffer!
-    private var tileCountsAtomicBuffer: MTLBuffer!  // Atomic counters for thread-safe tile updates
     private var viewUniformsBuffer: MTLBuffer!
     private var tileUniformsBuffer: MTLBuffer!
     private var splatCountBuffer: MTLBuffer!
+
+    // Morton code & radix sort buffers
+    private var mortonCodeBuffer: MTLBuffer!
+    private var sortedIndicesBuffer: MTLBuffer!
+    private var mortonCodeTempBuffer: MTLBuffer!
+    private var sortedIndicesTempBuffer: MTLBuffer!
+    private var histogramBuffer: MTLBuffer!
+    private var offsetBuffer: MTLBuffer!
     
     // Splat data
     private var splats: [GaussianSplat] = []
@@ -120,28 +130,26 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             fatalError("Could not create clear tiles pipeline: \(error)")
         }
 
-        // Setup compute pipeline for tile culling (splat-centric with atomics)
-        guard let tileCullingFunction = library.makeFunction(name: "buildTiles") else {
-            fatalError("Could not find buildTiles function")
+        // Setup Morton code + radix sort optimized pipelines
+        guard let mortonCodeFunction = library.makeFunction(name: "computeMortonCodes"),
+              let radixCountFunction = library.makeFunction(name: "radixSortCount"),
+              let radixScanFunction = library.makeFunction(name: "radixSortScan"),
+              let radixScatterFunction = library.makeFunction(name: "radixSortScatter"),
+              let buildOptimizedFunction = library.makeFunction(name: "buildTilesOptimized") else {
+            fatalError("Could not find optimized shader functions")
         }
 
         do {
-            tileCullingPipeline = try device.makeComputePipelineState(function: tileCullingFunction)
+            mortonCodePipeline = try device.makeComputePipelineState(function: mortonCodeFunction)
+            radixSortCountPipeline = try device.makeComputePipelineState(function: radixCountFunction)
+            radixSortScanPipeline = try device.makeComputePipelineState(function: radixScanFunction)
+            radixSortScatterPipeline = try device.makeComputePipelineState(function: radixScatterFunction)
+            buildTilesOptimizedPipeline = try device.makeComputePipelineState(function: buildOptimizedFunction)
         } catch {
-            fatalError("Could not create tile culling pipeline: \(error)")
+            fatalError("Could not create optimized pipelines: \(error)")
         }
 
-        // Setup compute pipeline for finalizing tile counts
-        guard let finalizeCountsFunction = library.makeFunction(name: "finalizeTileCounts") else {
-            fatalError("Could not find finalizeTileCounts function")
-        }
 
-        do {
-            finalizeTileCountsPipeline = try device.makeComputePipelineState(function: finalizeCountsFunction)
-        } catch {
-            fatalError("Could not create finalize tile counts pipeline: \(error)")
-        }
-        
         // Setup render pipeline for fullscreen pass
         guard let vertexFunction = library.makeFunction(name: "fullscreenVertex"),
               let fragmentFunction = library.makeFunction(name: "gaussianSplatFragment") else {
@@ -490,6 +498,46 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         // Set splat count
         let splatCountPtr = splatCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
         splatCountPtr[0] = UInt32(splats.count)
+
+        // Setup Morton code & radix sort buffers
+        setupMortonBuffers()
+    }
+
+    private func setupMortonBuffers() {
+        let splatCount = splats.count
+
+        // Morton codes and indices
+        mortonCodeBuffer = device.makeBuffer(
+            length: splatCount * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+
+        sortedIndicesBuffer = device.makeBuffer(
+            length: splatCount * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+
+        // Temporary buffers for radix sort ping-pong
+        mortonCodeTempBuffer = device.makeBuffer(
+            length: splatCount * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+
+        sortedIndicesTempBuffer = device.makeBuffer(
+            length: splatCount * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+
+        // Radix sort working buffers (256 bins per pass)
+        histogramBuffer = device.makeBuffer(
+            length: 256 * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+
+        offsetBuffer = device.makeBuffer(
+            length: 256 * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
     }
     
     private func setupTileBuffer(for drawableSize: CGSize) {
@@ -506,11 +554,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let tileDataSize = tileUniforms.totalTiles * MemoryLayout<TileData>.stride
         tileBuffer = device.makeBuffer(length: tileDataSize, options: .storageModeShared)
 
-        // Create atomic counter buffer (one uint32 counter per tile)
-        let atomicBufferSize = tileUniforms.totalTiles * MemoryLayout<UInt32>.stride
-        tileCountsAtomicBuffer = device.makeBuffer(length: atomicBufferSize, options: .storageModeShared)
-
-        // Clear tile buffer
+        // Clear tile buffer (initial setup only)
         let tilePtr = tileBuffer.contents().bindMemory(to: TileData.self, capacity: tileUniforms.totalTiles)
         for i in 0..<tileUniforms.totalTiles {
             tilePtr[i] = TileData()
@@ -561,15 +605,91 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         // Create lookAt matrix: camera always looks at target
         return createLookAtMatrix(eye: cameraPosition, target: cameraTarget, up: SIMD3<Float>(0, 1, 0))
     }
-    
+
     private func createProjectionMatrix(aspect: Float) -> simd_float4x4 {
         let fovy = Float.pi / 3.0 // 60 degrees
         let near: Float = 0.1
         let far: Float = 100.0
-        
+
         return createPerspectiveMatrix(fovy: fovy, aspect: aspect, near: near, far: far)
     }
-    
+
+    // MARK: - Morton Code + Radix Sort
+
+    private func performRadixSort(commandBuffer: MTLCommandBuffer, splatCount: Int) {
+        var keysIn = mortonCodeBuffer!
+        var keysOut = mortonCodeTempBuffer!
+        var indicesIn = sortedIndicesBuffer!
+        var indicesOut = sortedIndicesTempBuffer!
+
+        let threadsPerGrid = MTLSize(width: splatCount, height: 1, depth: 1)
+        let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
+
+        // 4 passes for 32-bit keys (8 bits per pass)
+        for pass in 0..<4 {
+            var passValue = UInt32(pass)
+
+            // PHASE 1: Clear histogram (for this pass)
+            if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+                blitEncoder.fill(buffer: histogramBuffer, range: 0..<histogramBuffer.length, value: 0)
+                blitEncoder.endEncoding()
+            }
+
+            // PHASE 2: Count digit occurrences (histogram)
+            if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+                computeEncoder.setComputePipelineState(radixSortCountPipeline)
+                computeEncoder.setBuffer(keysIn, offset: 0, index: 0)
+                computeEncoder.setBuffer(histogramBuffer, offset: 0, index: 1)
+                computeEncoder.setBytes(&passValue, length: MemoryLayout<UInt32>.stride, index: 2)
+                var count = UInt32(splatCount)
+                computeEncoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 3)
+                computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+                computeEncoder.endEncoding()
+            }
+
+            // PHASE 3: Prefix sum (exclusive scan) to get output positions
+            // This writes to offsetBuffer
+            if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+                computeEncoder.setComputePipelineState(radixSortScanPipeline)
+                computeEncoder.setBuffer(histogramBuffer, offset: 0, index: 0)
+                computeEncoder.setBuffer(offsetBuffer, offset: 0, index: 1)
+                let scanThreads = MTLSize(width: 1, height: 1, depth: 1)
+                computeEncoder.dispatchThreads(scanThreads, threadsPerThreadgroup: scanThreads)
+                computeEncoder.endEncoding()
+            }
+
+            // PHASE 4: Scatter elements to sorted positions
+            // CRITICAL: offsetBuffer gets modified atomically during scatter!
+            // We pass it in, and atomic operations increment the values
+            if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+                computeEncoder.setComputePipelineState(radixSortScatterPipeline)
+                computeEncoder.setBuffer(keysIn, offset: 0, index: 0)
+                computeEncoder.setBuffer(keysOut, offset: 0, index: 1)
+                computeEncoder.setBuffer(indicesIn, offset: 0, index: 2)
+                computeEncoder.setBuffer(indicesOut, offset: 0, index: 3)
+                computeEncoder.setBuffer(offsetBuffer, offset: 0, index: 4)
+                computeEncoder.setBytes(&passValue, length: MemoryLayout<UInt32>.stride, index: 5)
+                var count = UInt32(splatCount)
+                computeEncoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 6)
+                computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+                computeEncoder.endEncoding()
+            }
+
+            // Swap buffers for next pass
+            swap(&keysIn, &keysOut)
+            swap(&indicesIn, &indicesOut)
+        }
+
+        // After 4 passes with swaps, the sorted data is in the "In" buffers
+        // (swap happens after each pass, so: pass0→Out, pass1→In, pass2→Out, pass3→In)
+        // Copy final sorted data back to original buffers
+        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+            blitEncoder.copy(from: keysIn, sourceOffset: 0, to: mortonCodeBuffer, destinationOffset: 0, size: splatCount * MemoryLayout<UInt32>.stride)
+            blitEncoder.copy(from: indicesIn, sourceOffset: 0, to: sortedIndicesBuffer, destinationOffset: 0, size: splatCount * MemoryLayout<UInt32>.stride)
+            blitEncoder.endEncoding()
+        }
+    }
+
     // MARK: - MTKViewDelegate
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -603,14 +723,33 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         
         let viewUniformsPtr = viewUniformsBuffer.contents().bindMemory(to: ViewUniforms.self, capacity: 1)
         viewUniformsPtr[0] = viewUniforms
-        
-        // Phase 1a: Clear Tiles Compute Pass
+
+        // === OPTIMIZED PIPELINE: Morton Codes + Radix Sort ===
+
+        // PHASE 1: Compute Morton Codes
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(mortonCodePipeline)
+            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(mortonCodeBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(sortedIndicesBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 3)
+            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 4)
+
+            let threadsPerGrid = MTLSize(width: splats.count, height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
+            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
+        }
+
+        // PHASE 2: Radix Sort by Morton Code
+        performRadixSort(commandBuffer: commandBuffer, splatCount: splats.count)
+
+        // PHASE 1: Clear Tiles
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
             computeEncoder.setComputePipelineState(clearTilesPipeline)
             computeEncoder.setBuffer(tileBuffer, offset: 0, index: 0)
             computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 1)
 
-            // Dispatch one thread per tile (1D grid)
             let totalTiles = tileUniforms.totalTiles
             let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
             let threadgroupsPerGrid = MTLSize(
@@ -623,57 +762,28 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             computeEncoder.endEncoding()
         }
 
-        // Clear atomic counters
-        if let atomicPtr = tileCountsAtomicBuffer?.contents().bindMemory(to: UInt32.self, capacity: tileUniforms.totalTiles) {
-            for i in 0..<tileUniforms.totalTiles {
-                atomicPtr[i] = 0
-            }
-        }
-
-        // Phase 1b: Build Tiles - Splat-Centric Compute Pass with Atomics
+        // PHASE 4: Build Tiles Optimized (with binary search)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
-            computeEncoder.setComputePipelineState(tileCullingPipeline)
+            computeEncoder.setComputePipelineState(buildTilesOptimizedPipeline)
             computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(tileCountsAtomicBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(tileBuffer, offset: 0, index: 2)
-            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 3)
-            computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 4)
-            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 5)
+            computeEncoder.setBuffer(sortedIndicesBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(mortonCodeBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(tileBuffer, offset: 0, index: 3)
+            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 4)
+            computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 5)
+            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 6)
 
-            // Dispatch one thread per splat (1D grid)
-            let splatCount = splats.count
-            let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
             let threadgroupsPerGrid = MTLSize(
-                width: (splatCount + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
-                height: 1,
+                width: (Int(tileUniforms.tilesPerRow) + 7) / 8,
+                height: (Int(tileUniforms.tilesPerColumn) + 7) / 8,
                 depth: 1
             )
-
             computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
             computeEncoder.endEncoding()
         }
 
-        // Phase 1c: Finalize Tile Counts (copy atomic counts to TileData)
-        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
-            computeEncoder.setComputePipelineState(finalizeTileCountsPipeline)
-            computeEncoder.setBuffer(tileCountsAtomicBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(tileBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 2)
-
-            // Dispatch one thread per tile
-            let totalTiles = tileUniforms.totalTiles
-            let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
-            let threadgroupsPerGrid = MTLSize(
-                width: (totalTiles + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
-                height: 1,
-                depth: 1
-            )
-
-            computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-            computeEncoder.endEncoding()
-        }
-
-        // Phase 2: Fullscreen Rendering Pass
+        // PHASE 5: Fullscreen Rendering Pass
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
         

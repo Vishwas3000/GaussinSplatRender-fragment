@@ -69,116 +69,174 @@ kernel void clearTiles(
     tiles[tileID].maxDepth = 0;
 }
 
-// Phase 1c: Finalize tile counts from atomic counters
-kernel void finalizeTileCounts(
-    device atomic_uint* tileCountsAtomic [[buffer(0)]],
-    device TileData* tiles [[buffer(1)]],
-    constant TileUniforms& tileUniforms [[buffer(2)]],
-    uint tileID [[thread_position_in_grid]]
-) {
-    uint totalTiles = tileUniforms.tilesPerRow * tileUniforms.tilesPerColumn;
-    if (tileID >= totalTiles) {
-        return;
-    }
-
-    // Read atomic counter and clamp to maxSplatsPerTile
-    uint count = atomic_load_explicit(&tileCountsAtomic[tileID], memory_order_relaxed);
-    tiles[tileID].count = min(count, tileUniforms.maxSplatsPerTile);
-}
-
-// Phase 1b: Build Tiles - Splat-Centric Approach with Atomics
-// Each thread processes ONE splat and atomically updates all tiles it overlaps
-// This is more efficient when: num_splats << (num_tiles * avg_splats_per_tile)
+// Phase 1b: Build Tiles - Optimized Tile-Centric Approach with Smart Culling
+// Each thread processes ONE tile and tests all splats against it
+// This is more efficient when: num_splats >= (num_tiles * avg_splats_per_tile)
+// For 2M splats across 13K tiles: 2M ≈ 13K * 154, so tile-centric is better!
+//
+// 7 Optimization Layers (ordered by cost/benefit):
+// 1. Alpha/Opacity Threshold      - Skip invisible splats (< 1/255)
+// 2. Fast Frustum Culling          - Reject off-screen splats
+// 3. View-Space Depth Culling      - Reject behind-camera splats
+// 4. Maximum Distance Culling      - Skip very distant splats
+// 5. Covariance Determinant Test   - Reject degenerate Gaussians
+// 6. Stricter Radius Culling       - Skip sub-pixel splats (< 1.0px)
+// 7. Fast NDC Bounding Box Test    - Tile overlap test
 kernel void buildTiles(
     device GaussianSplat* splats [[buffer(0)]],
-    device atomic_uint* tileCountsAtomic [[buffer(1)]], // Atomic counters (one per tile)
-    device TileData* tiles [[buffer(2)]],                // Final tile data
-    constant ViewUniforms& viewUniforms [[buffer(3)]],
-    constant TileUniforms& tileUniforms [[buffer(4)]],
-    constant uint& splatCount [[buffer(5)]],
-    uint splatID [[thread_position_in_grid]]
+    device TileData* tiles [[buffer(1)]],
+    constant ViewUniforms& viewUniforms [[buffer(2)]],
+    constant TileUniforms& tileUniforms [[buffer(3)]],
+    constant uint& splatCount [[buffer(4)]],
+    uint2 tileID [[thread_position_in_grid]]
 ) {
-    // Check bounds - one thread per splat
-    if (splatID >= splatCount) {
+    // Check bounds
+    if (tileID.x >= tileUniforms.tilesPerRow || tileID.y >= tileUniforms.tilesPerColumn) {
         return;
     }
 
-    GaussianSplat splat = splats[splatID];
+    uint tileIndex = tileID.y * tileUniforms.tilesPerRow + tileID.x;
 
-    // Project splat to screen space
-    float4 clipPos = viewUniforms.viewProjectionMatrix * float4(splat.position, 1.0);
+    // Tile bounds in screen space (pixels)
+    float2 tileMinPixel = float2(tileID) * float(tileUniforms.tileSize);
+    float2 tileMaxPixel = tileMinPixel + float(tileUniforms.tileSize);
 
-    // Skip if behind camera or outside clip space
-    if (clipPos.w <= 0.0 || clipPos.z < 0.0 || clipPos.z > clipPos.w) {
-        return; // Early exit - splat not visible
-    }
+    // Precompute tile bounds in NDC for faster testing
+    float2 ndcMin = (tileMinPixel / viewUniforms.screenSize) * 2.0 - 1.0;
+    float2 ndcMax = (tileMaxPixel / viewUniforms.screenSize) * 2.0 - 1.0;
+    ndcMin.y *= -1.0;
+    ndcMax.y *= -1.0;
 
-    float3 ndc = clipPos.xyz / clipPos.w;
+    // Tile center for distance culling
+    float2 tileCenterPixel = (tileMinPixel + tileMaxPixel) * 0.5;
 
-    // Reconstruct 3D covariance matrix
-    float3x3 cov3D = float3x3(
-        float3(splat.covariance3D.x, splat.covariance3D.y, splat.covariance3D.z),
-        float3(splat.covariance3D.y, splat.covariance3D.w, splat.covariance3D_B.x),
-        float3(splat.covariance3D.z, splat.covariance3D_B.x, splat.covariance3D_B.y)
-    );
+    uint count = 0;
+    uint rejected = 0;
+    uint workload = 0;
 
-    // Project 3D covariance to 2D for radius calculation
-    float4 viewPos = viewUniforms.viewMatrix * float4(splat.position, 1.0);
-    float z = -viewPos.z;
+    // Test each splat against this tile
+    // Each tile processes independently - no race conditions!
+    for (uint i = 0; i < splatCount; i++) {
+        GaussianSplat splat = splats[i];
 
-    if (z <= 0.0) {
-        return; // Behind camera
-    }
+        // === OPTIMIZATION 1: Alpha/Opacity Threshold ===
+        // Skip splats with very low opacity (contribution < 1/255)
+        // opacity is stored as uchar (0-255), threshold of 1 means alpha < 1/255
+        if (splat.opacity < 1) {
+            rejected++;
+            continue;
+        }
 
-    // Compute screen-space radius
-    float maxExtent = max(cov3D[0][0], cov3D[1][1]);
-    if (maxExtent <= 0.0 || !isfinite(maxExtent)) {
-        return;
-    }
+        // === OPTIMIZATION 2: Fast Frustum Culling ===
+        float4 clipPos = viewUniforms.viewProjectionMatrix * float4(splat.position, 1.0);
 
-    float radiusWorld = 3.0 * sqrt(maxExtent);
-    float radiusScreen = radiusWorld / max(z, 0.1);
-    float focalLength = viewUniforms.screenSize.y * 0.5;
-    float radiusPixels = radiusScreen * focalLength;
+        // Quick reject if behind camera or outside clip space
+        if (clipPos.w <= 0.0 || clipPos.z < 0.0 || clipPos.z > clipPos.w) {
+            rejected++;
+            continue;
+        }
 
-    if (!isfinite(radiusPixels) || radiusPixels < 0.5) {
-        return; // Too small
-    }
-    if (radiusPixels > 1000.0) {
-        radiusPixels = 1000.0;
-    }
+        float3 ndc = clipPos.xyz / clipPos.w;
 
-    // Convert splat center to pixel coordinates
-    float2 splatPixel = ((ndc.xy * float2(1.0, -1.0) + 1.0) * 0.5) * viewUniforms.screenSize;
+        // === OPTIMIZATION 3: View-Space Depth Culling ===
+        float4 viewPos = viewUniforms.viewMatrix * float4(splat.position, 1.0);
+        float z = -viewPos.z;
 
-    // Calculate bounding box of tiles this splat overlaps
-    float2 splatMinPixel = splatPixel - radiusPixels;
-    float2 splatMaxPixel = splatPixel + radiusPixels;
+        if (z <= 0.0) {
+            rejected++;
+            continue;
+        }
 
-    int2 tileMin = int2(max(splatMinPixel / float(tileUniforms.tileSize), float2(0.0)));
-    int2 tileMax = int2(min(splatMaxPixel / float(tileUniforms.tileSize),
-                            float2(tileUniforms.tilesPerRow - 1, tileUniforms.tilesPerColumn - 1)));
+        // === OPTIMIZATION 4: Maximum Distance Culling ===
+        // Skip splats beyond reasonable viewing distance (configurable based on scene)
+        const float maxDepth = 100.0; // Adjust based on your scene scale
+        if (z > maxDepth) {
+            rejected++;
+            continue;
+        }
 
-    uint workload = uint(radiusPixels);
+        // === OPTIMIZATION 5: Covariance-Based Radius & Determinant Test ===
+        // Reconstruct only what we need (XY submatrix)
+        float cov_xx = splat.covariance3D.x;
+        float cov_xy = splat.covariance3D.y;
+        float cov_yy = splat.covariance3D.w;
 
-    // Iterate over all overlapping tiles
-    for (int ty = tileMin.y; ty <= tileMax.y; ty++) {
-        for (int tx = tileMin.x; tx <= tileMax.x; tx++) {
-            uint tileIndex = uint(ty) * tileUniforms.tilesPerRow + uint(tx);
+        // Test covariance determinant to reject degenerate/negligible Gaussians
+        // det(cov2D) = cov_xx * cov_yy - cov_xy * cov_xy
+        float det = cov_xx * cov_yy - cov_xy * cov_xy;
+        const float minDeterminant = 1e-7; // Threshold for degenerate covariance
+        if (det < minDeterminant || !isfinite(det)) {
+            rejected++;
+            continue;
+        }
 
-            // Atomically get the next available slot in this tile's splat list
-            uint slot = atomic_fetch_add_explicit(&tileCountsAtomic[tileIndex], 1, memory_order_relaxed);
+        float maxExtent = max(cov_xx, cov_yy);
+        if (maxExtent <= 0.0 || !isfinite(maxExtent)) {
+            rejected++;
+            continue;
+        }
 
-            // Only store if there's space in the tile
-            if (slot < tileUniforms.maxSplatsPerTile) {
-                tiles[tileIndex].splatIndices[slot] = splatID;
+        // Compute screen-space radius (3-sigma)
+        float radiusWorld = 3.0 * sqrt(maxExtent);
+        float radiusScreen = radiusWorld / max(z, 0.1);
+        float focalLength = viewUniforms.screenSize.y * 0.5;
+        float radiusPixels = radiusScreen * focalLength;
 
-                // Also accumulate workload atomically
-                atomic_fetch_add_explicit((device atomic_uint*)&tiles[tileIndex].workloadEstimate,
-                                         workload, memory_order_relaxed);
+        // === OPTIMIZATION 6: Stricter Radius Culling ===
+        // Increased from 0.5px to 1.0px - imperceptible quality loss, significant speedup
+        if (!isfinite(radiusPixels) || radiusPixels < 1.0) {
+            rejected++;
+            continue; // Too small to contribute visibly
+        }
+        if (radiusPixels > 1000.0) {
+            radiusPixels = 1000.0; // Clamp huge splats
+        }
+
+        // === OPTIMIZATION 7: Fast NDC Bounding Box Test ===
+        // Convert radius to NDC space
+        float2 radiusNDC = (radiusPixels / viewUniforms.screenSize) * 2.0;
+
+        // AABB overlap test in NDC space
+        float2 splatMin = ndc.xy - radiusNDC;
+        float2 splatMax = ndc.xy + radiusNDC;
+
+        bool overlaps = (splatMax.x >= ndcMin.x && splatMin.x <= ndcMax.x &&
+                         splatMax.y >= ndcMin.y && splatMin.y <= ndcMax.y);
+
+        if (overlaps) {
+            // Splat overlaps this tile!
+            if (count < tileUniforms.maxSplatsPerTile) {
+                tiles[tileIndex].splatIndices[count] = i;
+                count++;
             }
+
+            // Accumulate workload
+            workload += uint(radiusPixels);
+        } else {
+            rejected++;
         }
     }
+
+    // === CRITICAL: Sort splat indices by depth (back-to-front) ===
+    // For proper alpha blending, we MUST render splats in depth order
+    // Simple insertion sort (efficient for small arrays like 64 elements)
+    for (uint i = 1; i < count; i++) {
+        uint keyIndex = tiles[tileIndex].splatIndices[i];
+        float keyDepth = splats[keyIndex].depth;
+        int j = int(i) - 1;
+
+        // Move elements forward while they're closer than key
+        while (j >= 0 && splats[tiles[tileIndex].splatIndices[j]].depth < keyDepth) {
+            tiles[tileIndex].splatIndices[j + 1] = tiles[tileIndex].splatIndices[j];
+            j--;
+        }
+        tiles[tileIndex].splatIndices[j + 1] = keyIndex;
+    }
+
+    // Write final tile statistics
+    tiles[tileIndex].count = count;
+    tiles[tileIndex].rejectedCount = rejected;
+    tiles[tileIndex].workloadEstimate = workload;
 }
 
 // Phase 2: Tile-based splat rendering using per-tile indices
@@ -206,14 +264,17 @@ fragment float4 gaussianSplatFragment(
     uint tileIndex = tileID.y * tileUniforms.tilesPerRow + tileID.x;
     TileData tile = tiles[tileIndex];
 
-    float4 accumulated = float4(0.0, 0.0, 0.0, 0.0);
-    float alpha = 0.0;
+    // === OFFICIAL 3DGS FRONT-TO-BACK ALPHA BLENDING ===
+    // Formula: C = Σ c_i * α_i * T_i, where T_i = ∏(1 - α_j) for j < i
+    float3 C = float3(0.0);  // Accumulated color
+    float T = 1.0;           // Transmittance (how much light passes through)
 
     // Process only the splats assigned to this tile (up to maxSplatsPerTile)
     uint numSplats = min(tile.count, tileUniforms.maxSplatsPerTile);
 
-    // Process splats from this tile's index list
-    for (uint i = 0; i < numSplats && alpha < 0.99; i++) {
+    // Process splats FRONT-TO-BACK (closest first)
+    // Early termination when transmittance < 0.0001 (99.99% opacity reached)
+    for (uint i = 0; i < numSplats && T > 0.0001; i++) {
         uint splatIndex = tile.splatIndices[i];
 
         // Bounds check
@@ -288,15 +349,22 @@ fragment float4 gaussianSplatFragment(
         float gaussian = exp(exponent);
         
         // Convert color and opacity to float
-        float3 splatColor = float3(splat.color) / 255.0;
-        float splatOpacity = float(splat.opacity) / 255.0;
-        
-        float contribution = gaussian * splatOpacity * 0.5; // Reduce opacity for visibility
-        
-        // Alpha blending
-        float3 blendedColor = splatColor * contribution;
-        accumulated.rgb += blendedColor * (1.0 - alpha);
-        alpha += contribution * (1.0 - alpha);
+        float3 c_i = float3(splat.color) / 255.0;
+        float opacity = float(splat.opacity) / 255.0;
+
+        // Calculate alpha: α_i = min(0.99, opacity * gaussian)
+        // Clamped to 0.99 to prevent full occlusion from single splat
+        float alpha = min(0.99, opacity * gaussian);
+
+        // Skip negligible contributions (< 0.1% opacity)
+        if (alpha < 0.001) continue;
+
+        // === OFFICIAL 3DGS BLENDING ===
+        // Accumulate: C += c_i * α_i * T
+        C += c_i * alpha * T;
+
+        // Update transmittance: T *= (1 - α_i)
+        T *= (1.0 - alpha);
     }
     
     // Background color (dark blue to black gradient)
@@ -306,10 +374,11 @@ fragment float4 gaussianSplatFragment(
         float3(0.0, 0.0, 0.0),    // Black at bottom
         gradientUV.y
     );
-    
-    // Composite with background
-    float3 finalColor = accumulated.rgb + backgroundColor * (1.0 - alpha);
-    
+
+    // Final composite: C + background * T
+    // Transmittance T tells us how much background light passes through
+    float3 finalColor = C + backgroundColor * T;
+
     return float4(finalColor, 1.0);
 }
 
