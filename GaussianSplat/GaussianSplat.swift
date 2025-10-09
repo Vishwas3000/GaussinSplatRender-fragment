@@ -67,6 +67,20 @@ struct GaussianSplat {
     }
 }
 
+struct PreprocessedSplat {
+    var screenCenter: SIMD2<Float>        // Pixel coordinates of splat center
+    var invCov2D_row0: SIMD3<Float>       // Inverted 2D covariance matrix row 0 [a, b] + padding
+    var invCov2D_row1: SIMD2<Float>       // Inverted 2D covariance matrix row 1 [c, d]
+    var color: SIMD3<UInt8>               // RGB color
+    var opacity: UInt8                    // Opacity
+    var depth: Float                      // For sorting
+    var isValid: UInt32                   // 1 if visible, 0 if culled
+
+    static var stride: Int {
+        return MemoryLayout<PreprocessedSplat>.stride
+    }
+}
+
 struct TileData {
     var count: UInt32           // Number of splats assigned to this tile
     var rejectedCount: UInt32   // Number of splats rejected (culled) from this tile
@@ -106,18 +120,35 @@ struct ViewUniforms {
     let screenSize: SIMD2<Float>
     let padding: SIMD2<Float>
     
-    init(viewMatrix: simd_float4x4, 
-         projectionMatrix: simd_float4x4, 
-         cameraPosition: SIMD3<Float>, 
-         screenSize: SIMD2<Float>, 
+    init(viewMatrix: simd_float4x4,
+         projectionMatrix: simd_float4x4,
+         viewProjectionMatrix: simd_float4x4,
+         cameraPosition: SIMD3<Float>,
+         screenSize: SIMD2<Float>,
          time: Float = 0) {
         self.viewMatrix = viewMatrix
         self.projectionMatrix = projectionMatrix
-        self.viewProjectionMatrix = projectionMatrix * viewMatrix
+        self.viewProjectionMatrix = viewProjectionMatrix
         self.cameraPosition = cameraPosition
         self.time = time
         self.screenSize = screenSize
         self.padding = SIMD2<Float>(0, 0)
+    }
+
+    // Convenience initializer that computes viewProjectionMatrix
+    init(viewMatrix: simd_float4x4,
+         projectionMatrix: simd_float4x4,
+         cameraPosition: SIMD3<Float>,
+         screenSize: SIMD2<Float>,
+         time: Float = 0) {
+        self.init(
+            viewMatrix: viewMatrix,
+            projectionMatrix: projectionMatrix,
+            viewProjectionMatrix: projectionMatrix * viewMatrix,
+            cameraPosition: cameraPosition,
+            screenSize: screenSize,
+            time: time
+        )
     }
 }
 
