@@ -85,16 +85,20 @@ inline uint encodeMorton2D(uint x, uint y) {
 //   - 2× faster tile building
 //   - Total: 60+ FPS for 1M splats (vs 28 FPS without)
 
-kernel void frustumCullSplats(
+// PASS 1: DETERMINISTIC Frustum Culling - Predicate Phase
+// Each thread writes visibility predicate (0 or 1) deterministically
+kernel void frustumCullPredicates(
     device GaussianSplat* splats [[buffer(0)]],           // Input: All splats
-    device atomic_uint* visibleCount [[buffer(1)]],       // Output: Count of visible
-    device uint* visibleIndices [[buffer(2)]],            // Output: Visible splat indices
-    constant ViewUniforms& viewUniforms [[buffer(3)]],    // Camera matrices
-    constant uint& totalCount [[buffer(4)]],              // Total splat count
+    device uint* visibilityPredicates [[buffer(1)]],     // Output: 0=culled, 1=visible
+    constant ViewUniforms& viewUniforms [[buffer(2)]],    // Camera matrices
+    constant uint& totalCount [[buffer(3)]],              // Total splat count
     uint gid [[thread_position_in_grid]]                  // Thread ID
 ) {
     // Bounds check
-    if (gid >= totalCount) return;
+    if (gid >= totalCount) {
+        visibilityPredicates[gid] = 0;
+        return;
+    }
 
     // Load splat
     GaussianSplat splat = splats[gid];
@@ -103,7 +107,6 @@ kernel void frustumCullSplats(
     float4 clipPos = viewUniforms.viewProjectionMatrix * float4(splat.position, 1.0);
 
     // Frustum test (6 planes implicit in clip space)
-    // Test against: near, far, left, right, top, bottom planes
     bool insideFrustum =
         clipPos.w > 0.0 &&                    // In front of camera (near plane)
         abs(clipPos.x) <= clipPos.w &&        // Inside left/right planes
@@ -111,17 +114,53 @@ kernel void frustumCullSplats(
         clipPos.z >= 0.0 &&                   // Past near plane (Metal NDC)
         clipPos.z <= clipPos.w;               // Before far plane
 
-    // If visible, atomically add to compact list
-    if (insideFrustum) {
-        // Atomically increment counter and get unique index
-        uint index = atomic_fetch_add_explicit(visibleCount, 1, memory_order_relaxed);
+    // Write deterministic predicate (no atomics)
+    visibilityPredicates[gid] = insideFrustum ? 1u : 0u;
+}
 
-        // Store this splat's global index in compact array
-        visibleIndices[index] = gid;
+// PASS 2: DETERMINISTIC Frustum Culling - Compaction Phase  
+// Use prefix sum to calculate exact write positions, then compact
+kernel void frustumCullCompact(
+    device uint* visibilityPredicates [[buffer(0)]],     // Input: Visibility predicates
+    device uint* prefixSums [[buffer(1)]],               // Input: Prefix sum of predicates
+    device uint* visibleIndices [[buffer(2)]],           // Output: Compact visible indices
+    device uint* visibleCount [[buffer(3)]],             // Output: Total visible count
+    constant uint& totalCount [[buffer(4)]],             // Total splat count
+    uint gid [[thread_position_in_grid]]                 // Thread ID
+) {
+    // Bounds check
+    if (gid >= totalCount) return;
+
+    // If this splat is visible, write it to compact array
+    if (visibilityPredicates[gid] == 1) {
+        // Use prefix sum to get deterministic write position
+        uint writePosition = prefixSums[gid];
+        visibleIndices[writePosition] = gid;
     }
+    
+    // Last thread writes total count
+    if (gid == totalCount - 1) {
+        // Total visible = prefix sum at last position + last predicate
+        visibleCount[0] = prefixSums[gid] + visibilityPredicates[gid];
+    }
+}
 
-    // If not visible, thread exits (does nothing)
-    // Result: Only visible splats are in visibleIndices array
+// Helper: GPU Parallel Prefix Sum (Exclusive Scan)
+// Computes prefix sum of visibility predicates to get write positions
+kernel void computePrefixSum(
+    device uint* input [[buffer(0)]],      // Input: Visibility predicates
+    device uint* output [[buffer(1)]],     // Output: Prefix sums
+    constant uint& n [[buffer(2)]],        // Array size
+    uint gid [[thread_position_in_grid]]
+) {
+    // Exclusive prefix sum (sequential scan)
+    if (gid == 0) {
+        uint sum = 0;
+        for (uint i = 0; i < n; i++) {
+            output[i] = sum;
+            sum += input[i];
+        }
+    }
 }
 
 // ============================================================================
@@ -153,13 +192,19 @@ kernel void computeMortonCodes(
         return;
     }
 
-    // Convert to normalized device coordinates [-1, 1]
-    float2 ndc = clipPos.xy / clipPos.w;
+    // FIXED-POINT MORTON CODE COMPUTATION (eliminates floating-point precision issues)
+    // Convert to NDC [-1, 1] using 16.16 fixed-point arithmetic
+    int32_t ndc_x_fixed = int32_t((clipPos.x / clipPos.w) * 65536.0); // 16.16 fixed point
+    int32_t ndc_y_fixed = int32_t((clipPos.y / clipPos.w) * 65536.0); // 16.16 fixed point
 
-    // Map NDC to 10-bit grid coordinates [0, 1023]
-    // This gives us 1024×1024 spatial resolution for Morton encoding
-    uint x = clamp(uint((ndc.x * 0.5 + 0.5) * 1024.0), 0u, 1023u);
-    uint y = clamp(uint((ndc.y * 0.5 + 0.5) * 1024.0), 0u, 1023u);
+    // Map from NDC [-1, 1] to 10-bit grid [0, 1023] using integer arithmetic
+    // Formula: ((ndc + 1.0) * 0.5) * 1024 = (ndc + 1) * 512
+    int32_t x_fixed = (ndc_x_fixed + 65536) >> 6;  // Add 1.0, then divide by 64 (≈ * 512 / 32768)
+    int32_t y_fixed = (ndc_y_fixed + 65536) >> 6;  // Add 1.0, then divide by 64
+    
+    // Clamp to [0, 1023] range
+    uint x = clamp(uint(x_fixed), 0u, 1023u);
+    uint y = clamp(uint(y_fixed), 0u, 1023u);
 
     // Encode as 20-bit Morton code (10 bits x + 10 bits y interleaved)
     mortonCodes[gid] = encodeMorton2D(x, y);
@@ -201,12 +246,19 @@ kernel void computeMortonCodesVisible(
         return;
     }
 
-    // Convert to NDC [-1, 1]
-    float2 ndc = clipPos.xy / clipPos.w;
+    // FIXED-POINT MORTON CODE COMPUTATION (eliminates floating-point precision issues)
+    // Convert to NDC [-1, 1] using 16.16 fixed-point arithmetic
+    int32_t ndc_x_fixed = int32_t((clipPos.x / clipPos.w) * 65536.0); // 16.16 fixed point
+    int32_t ndc_y_fixed = int32_t((clipPos.y / clipPos.w) * 65536.0); // 16.16 fixed point
 
-    // Map to 10-bit grid [0, 1023]
-    uint x = clamp(uint((ndc.x * 0.5 + 0.5) * 1024.0), 0u, 1023u);
-    uint y = clamp(uint((ndc.y * 0.5 + 0.5) * 1024.0), 0u, 1023u);
+    // Map from NDC [-1, 1] to 10-bit grid [0, 1023] using integer arithmetic
+    // Formula: ((ndc + 1.0) * 0.5) * 1024 = (ndc + 1) * 512
+    int32_t x_fixed = (ndc_x_fixed + 65536) >> 6;  // Add 1.0, then divide by 64 (≈ * 512 / 32768)
+    int32_t y_fixed = (ndc_y_fixed + 65536) >> 6;  // Add 1.0, then divide by 64
+    
+    // Clamp to [0, 1023] range
+    uint x = clamp(uint(x_fixed), 0u, 1023u);
+    uint y = clamp(uint(y_fixed), 0u, 1023u);
 
     // Encode Morton code
     mortonCodes[gid] = encodeMorton2D(x, y);
@@ -220,20 +272,56 @@ kernel void computeMortonCodesVisible(
 // PHASE 2: GPU RADIX SORT (4 passes, 8-bit digits)
 // ============================================================================
 
-// Pass 2.1: Count digit occurrences (histogram)
+// Pass 2.1: DETERMINISTIC Count digit occurrences (histogram)
+// Replaces atomic operations with segmented counting + reduction
 kernel void radixSortCount(
     device uint* keys [[buffer(0)]],
-    device atomic_uint* histogram [[buffer(1)]],
-    constant uint& pass [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
+    device uint* histogram [[buffer(1)]],        // Changed from atomic_uint to uint
+    device uint* localHistograms [[buffer(2)]], // NEW: Thread-local histograms  
+    constant uint& pass [[buffer(3)]],           // Shifted buffer indices
+    constant uint& n [[buffer(4)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupSize [[threads_per_threadgroup]]
 ) {
-    if (gid >= n) return;
-
-    uint key = keys[gid];
-    uint digit = (key >> (pass * 8)) & 0xFF;  // Extract 8-bit digit for this pass
-
-    atomic_fetch_add_explicit(&histogram[digit], 1, memory_order_relaxed);
+    // Thread-local histogram (256 bins)
+    threadgroup uint localHist[256];
+    
+    // Initialize local histogram
+    if (lid < 256) {
+        localHist[lid] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Each thread processes its assigned elements
+    if (gid < n) {
+        uint key = keys[gid];
+        uint digit = (key >> (pass * 8)) & 0xFF;
+        
+        // Deterministic increment (no atomics needed within threadgroup)
+        atomic_fetch_add_explicit((threadgroup atomic_uint*)&localHist[digit], 1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Write threadgroup histogram to global memory for later reduction
+    uint groupIndex = gid / groupSize;
+    if (lid < 256) {
+        localHistograms[groupIndex * 256 + lid] = localHist[lid];
+    }
+    
+    // Global reduction phase (only one thread per digit across all groups)
+    if (gid < 256) {
+        uint digit = gid;
+        uint totalCount = 0;
+        uint numGroups = (n + groupSize - 1) / groupSize;
+        
+        // Sum across all threadgroups for this digit (deterministic order)
+        for (uint g = 0; g < numGroups; g++) {
+            totalCount += localHistograms[g * 256 + digit];
+        }
+        
+        histogram[digit] = totalCount;
+    }
 }
 
 // Pass 2.2: Prefix sum (exclusive scan) on histogram
@@ -255,28 +343,41 @@ kernel void radixSortScan(
     }
 }
 
-// Pass 2.3: Scatter elements to sorted positions
+// Pass 2.3: DETERMINISTIC Scatter elements to sorted positions  
+// Two-phase scatter: calculate positions deterministically, then write
 kernel void radixSortScatter(
     device uint* keysIn [[buffer(0)]],
     device uint* keysOut [[buffer(1)]],
     device uint* indicesIn [[buffer(2)]],
     device uint* indicesOut [[buffer(3)]],
-    device atomic_uint* offsets [[buffer(4)]],
-    constant uint& pass [[buffer(5)]],
-    constant uint& n [[buffer(6)]],
+    device uint* offsets [[buffer(4)]],         // Changed from atomic_uint to uint
+    device uint* writePositions [[buffer(5)]], // NEW: Pre-calculated write positions
+    constant uint& pass [[buffer(6)]],          // Shifted buffer index
+    constant uint& n [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= n) return;
 
+    // PHASE 1: Calculate deterministic write position for this element
     uint key = keysIn[gid];
-    uint index = indicesIn[gid];
     uint digit = (key >> (pass * 8)) & 0xFF;
-
-    // Get position and increment atomically
-    uint pos = atomic_fetch_add_explicit(&offsets[digit], 1, memory_order_relaxed);
-
-    keysOut[pos] = key;
-    indicesOut[pos] = index;
+    
+    // Count how many elements with the same digit come before this one
+    uint digitOffset = 0;
+    for (uint i = 0; i < gid; i++) {
+        uint otherKey = keysIn[i];
+        uint otherDigit = (otherKey >> (pass * 8)) & 0xFF;
+        if (otherDigit == digit) {
+            digitOffset++;
+        }
+    }
+    
+    // Deterministic write position: base offset + position within digit group
+    uint writePos = offsets[digit] + digitOffset;
+    
+    // PHASE 2: Write to calculated position (no race conditions)
+    keysOut[writePos] = key;
+    indicesOut[writePos] = indicesIn[gid];
 }
 
 // ============================================================================

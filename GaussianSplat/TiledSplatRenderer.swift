@@ -18,7 +18,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     
     // Compute pipelines - Optimized Morton Code + Radix Sort + Frustum Culling
     private var preprocessSplatsPipeline: MTLComputePipelineState!
-    private var frustumCullPipeline: MTLComputePipelineState!           // NEW!
+    // frustumCullPipeline removed - using deterministic approach instead
     private var mortonCodePipeline: MTLComputePipelineState!
     private var mortonCodeVisiblePipeline: MTLComputePipelineState!     // NEW!
     private var radixSortCountPipeline: MTLComputePipelineState!
@@ -29,6 +29,11 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var buildTilesVisiblePipeline: MTLComputePipelineState!     // NEW!
     private var buildTilesPipeline: MTLComputePipelineState!            // Original tile building
     private var sortTileDepthPipeline: MTLComputePipelineState!         // Depth sorting for stability
+    
+    // Deterministic GPU pipelines
+    private var frustumCullPredicatesPipeline: MTLComputePipelineState!
+    private var frustumCullCompactPipeline: MTLComputePipelineState!
+    private var computePrefixSumPipeline: MTLComputePipelineState!
 
     // Render pipeline for fullscreen pass
     private var renderPipeline: MTLRenderPipelineState!
@@ -54,11 +59,19 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var sortedIndicesTempBuffer: MTLBuffer!
     private var histogramBuffer: MTLBuffer!
     private var offsetBuffer: MTLBuffer!
+    
+    // NEW: Deterministic radix sort buffers
+    private var localHistogramsBuffer: MTLBuffer!
+    private var writePositionsBuffer: MTLBuffer!
 
     // GPU Frustum Culling buffers
     private var visibleSplatIndicesBuffer: MTLBuffer!
     private var visibleSplatCountBuffer: MTLBuffer!
-    private var useGPUFrustumCulling: Bool = false  // DISABLED: Test if atomic operations cause flickering
+    
+    // Deterministic frustum culling buffers
+    private var visibilityPredicatesBuffer: MTLBuffer!
+    private var prefixSumsBuffer: MTLBuffer!
+    private var useGPUFrustumCulling: Bool = true   // ENABLED: Using deterministic frustum culling
     
     // Simple CPU Sorting (Energy Efficient)
     private var useHybridSorting: Bool = false  // Enable simple CPU distance sorting
@@ -170,16 +183,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             fatalError("Could not create preprocess pipeline: \(error)")
         }
 
-        // Setup GPU frustum culling pipeline
-        guard let frustumCullFunction = library.makeFunction(name: "frustumCullSplats") else {
-            fatalError("Could not find frustumCullSplats function")
-        }
-
-        do {
-            frustumCullPipeline = try device.makeComputePipelineState(function: frustumCullFunction)
-        } catch {
-            fatalError("Could not create frustum cull pipeline: \(error)")
-        }
+        // Old frustum culling pipeline removed - now using deterministic approach
 
         // Setup Morton code + radix sort optimized pipelines
         guard let mortonCodeFunction = library.makeFunction(name: "computeMortonCodes"),
@@ -190,7 +194,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
               let buildTilesFunction = library.makeFunction(name: "buildTiles"),
               let buildOptimizedFunction = library.makeFunction(name: "buildTilesOptimized"),
               let buildVisibleFunction = library.makeFunction(name: "buildTilesWithVisibleList"),
-              let sortDepthFunction = library.makeFunction(name: "sortTileDepth") else {
+              let sortDepthFunction = library.makeFunction(name: "sortTileDepth"),
+              let frustumCullPredicatesFunction = library.makeFunction(name: "frustumCullPredicates"),
+              let frustumCullCompactFunction = library.makeFunction(name: "frustumCullCompact"),
+              let computePrefixSumFunction = library.makeFunction(name: "computePrefixSum") else {
             fatalError("Could not find optimized shader functions")
         }
 
@@ -204,6 +211,11 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             buildTilesOptimizedPipeline = try device.makeComputePipelineState(function: buildOptimizedFunction)
             buildTilesVisiblePipeline = try device.makeComputePipelineState(function: buildVisibleFunction)
             sortTileDepthPipeline = try device.makeComputePipelineState(function: sortDepthFunction)
+            
+            // Deterministic GPU pipelines
+            frustumCullPredicatesPipeline = try device.makeComputePipelineState(function: frustumCullPredicatesFunction)
+            frustumCullCompactPipeline = try device.makeComputePipelineState(function: frustumCullCompactFunction)
+            computePrefixSumPipeline = try device.makeComputePipelineState(function: computePrefixSumFunction)
         } catch {
             fatalError("Could not create optimized pipelines: \(error)")
         }
@@ -591,7 +603,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             options: .storageModeShared
         )
 
-        // Radix sort working buffers (256 bins per pass)
+        // DETERMINISTIC RADIX SORT: Updated buffers for non-atomic operations
         histogramBuffer = device.makeBuffer(
             length: 256 * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
@@ -599,6 +611,20 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
 
         offsetBuffer = device.makeBuffer(
             length: 256 * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+        
+        // NEW: Local histograms buffer for deterministic counting
+        // Size: (max_threadgroups) × 256 bins × 4 bytes
+        let maxThreadgroups = (splatCount + 255) / 256  // Assuming 256 threads per group
+        localHistogramsBuffer = device.makeBuffer(
+            length: maxThreadgroups * 256 * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+        
+        // NEW: Write positions buffer for deterministic scatter
+        writePositionsBuffer = device.makeBuffer(
+            length: splatCount * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
         )
 
@@ -612,6 +638,17 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         // visibleSplatCountBuffer: Atomic counter for number of visible splats
         visibleSplatCountBuffer = device.makeBuffer(
             length: MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+        
+        // Deterministic frustum culling buffers
+        visibilityPredicatesBuffer = device.makeBuffer(
+            length: splatCount * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+        
+        prefixSumsBuffer = device.makeBuffer(
+            length: splatCount * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
         )
     }
@@ -721,26 +758,27 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         for pass in 0..<4 {
             var passValue = UInt32(pass)
 
-            // PHASE 1: Clear histogram (for this pass)
+            // PHASE 1: Clear histogram and local histograms
             if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
                 blitEncoder.fill(buffer: histogramBuffer, range: 0..<histogramBuffer.length, value: 0)
+                blitEncoder.fill(buffer: localHistogramsBuffer, range: 0..<localHistogramsBuffer.length, value: 0)
                 blitEncoder.endEncoding()
             }
 
-            // PHASE 2: Count digit occurrences (histogram)
+            // PHASE 2: DETERMINISTIC Count digit occurrences (histogram)
             if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
                 computeEncoder.setComputePipelineState(radixSortCountPipeline)
                 computeEncoder.setBuffer(keysIn, offset: 0, index: 0)
                 computeEncoder.setBuffer(histogramBuffer, offset: 0, index: 1)
-                computeEncoder.setBytes(&passValue, length: MemoryLayout<UInt32>.stride, index: 2)
+                computeEncoder.setBuffer(localHistogramsBuffer, offset: 0, index: 2)
+                computeEncoder.setBytes(&passValue, length: MemoryLayout<UInt32>.stride, index: 3)
                 var count = UInt32(splatCount)
-                computeEncoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 3)
+                computeEncoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 4)
                 computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
                 computeEncoder.endEncoding()
             }
 
             // PHASE 3: Prefix sum (exclusive scan) to get output positions
-            // This writes to offsetBuffer
             if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
                 computeEncoder.setComputePipelineState(radixSortScanPipeline)
                 computeEncoder.setBuffer(histogramBuffer, offset: 0, index: 0)
@@ -750,9 +788,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
                 computeEncoder.endEncoding()
             }
 
-            // PHASE 4: Scatter elements to sorted positions
-            // CRITICAL: offsetBuffer gets modified atomically during scatter!
-            // We pass it in, and atomic operations increment the values
+            // PHASE 4: DETERMINISTIC Scatter elements to sorted positions
             if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
                 computeEncoder.setComputePipelineState(radixSortScatterPipeline)
                 computeEncoder.setBuffer(keysIn, offset: 0, index: 0)
@@ -760,9 +796,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
                 computeEncoder.setBuffer(indicesIn, offset: 0, index: 2)
                 computeEncoder.setBuffer(indicesOut, offset: 0, index: 3)
                 computeEncoder.setBuffer(offsetBuffer, offset: 0, index: 4)
-                computeEncoder.setBytes(&passValue, length: MemoryLayout<UInt32>.stride, index: 5)
+                computeEncoder.setBuffer(writePositionsBuffer, offset: 0, index: 5)
+                computeEncoder.setBytes(&passValue, length: MemoryLayout<UInt32>.stride, index: 6)
                 var count = UInt32(splatCount)
-                computeEncoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 6)
+                computeEncoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 7)
                 computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
                 computeEncoder.endEncoding()
             }
@@ -773,13 +810,88 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         }
 
         // After 4 passes with swaps, the sorted data is in the "In" buffers
-        // (swap happens after each pass, so: pass0→Out, pass1→In, pass2→Out, pass3→In)
         // Copy final sorted data back to original buffers
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
             blitEncoder.copy(from: keysIn, sourceOffset: 0, to: mortonCodeBuffer, destinationOffset: 0, size: splatCount * MemoryLayout<UInt32>.stride)
             blitEncoder.copy(from: indicesIn, sourceOffset: 0, to: sortedIndicesBuffer, destinationOffset: 0, size: splatCount * MemoryLayout<UInt32>.stride)
             blitEncoder.endEncoding()
         }
+    }
+    
+    private func performDeterministicFrustumCulling(commandBuffer: MTLCommandBuffer, splatCount: Int) -> UInt32 {
+        // PHASE 1: Generate visibility predicates (0/1 for each splat)
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(frustumCullPredicatesPipeline)
+            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(visibilityPredicatesBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 2)
+            var totalCount = UInt32(splatCount)
+            computeEncoder.setBytes(&totalCount, length: MemoryLayout<UInt32>.stride, index: 3)
+            
+            let threadsPerGrid = MTLSize(width: splatCount, height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
+            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
+        }
+        
+        // PHASE 2: Compute prefix sum on visibility predicates
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(computePrefixSumPipeline)
+            computeEncoder.setBuffer(visibilityPredicatesBuffer, offset: 0, index: 0)  // Input: predicates
+            computeEncoder.setBuffer(prefixSumsBuffer, offset: 0, index: 1)           // Output: prefix sums
+            var totalCount = UInt32(splatCount)
+            computeEncoder.setBytes(&totalCount, length: MemoryLayout<UInt32>.stride, index: 2)
+            
+            // Single threadgroup for prefix sum (sequential operation)
+            let threadsPerGrid = MTLSize(width: 1, height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: 1, height: 1, depth: 1)
+            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
+        }
+        
+        // PHASE 3: Compact visible splats using predicates and prefix sum
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(frustumCullCompactPipeline)
+            computeEncoder.setBuffer(visibilityPredicatesBuffer, offset: 0, index: 0)  // Input: original predicates
+            computeEncoder.setBuffer(prefixSumsBuffer, offset: 0, index: 1)           // Input: prefix sums
+            computeEncoder.setBuffer(visibleSplatIndicesBuffer, offset: 0, index: 2)  // Output: visible indices
+            computeEncoder.setBuffer(visibleSplatCountBuffer, offset: 0, index: 3)    // Output: visible count
+            var totalCount = UInt32(splatCount)
+            computeEncoder.setBytes(&totalCount, length: MemoryLayout<UInt32>.stride, index: 4)
+            
+            let threadsPerGrid = MTLSize(width: splatCount, height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
+            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
+        }
+        
+        // Read back visible count (deterministic result)
+        let visibleCountPtr = visibleSplatCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
+        let finalCount = visibleCountPtr[0]
+        
+        // Debug: Print frustum culling results
+        if frameCount % 60 == 0 {
+            print("🔍 Deterministic Frustum Culling: \(finalCount)/\(splatCount) splats visible")
+            
+            // Debug: Check first few visibility predicates
+            let predicatesPtr = visibilityPredicatesBuffer.contents().bindMemory(to: UInt32.self, capacity: min(10, splatCount))
+            let predicates = Array(UnsafeBufferPointer(start: predicatesPtr, count: min(10, splatCount)))
+            print("   Visibility predicates [0-9]: \(predicates)")
+            
+            // Debug: Check prefix sums
+            let prefixPtr = prefixSumsBuffer.contents().bindMemory(to: UInt32.self, capacity: min(10, splatCount))
+            let prefixSums = Array(UnsafeBufferPointer(start: prefixPtr, count: min(10, splatCount)))
+            print("   Prefix sums [0-9]: \(prefixSums)")
+            
+            // Debug: Check visible indices
+            if finalCount > 0 {
+                let visiblePtr = visibleSplatIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: Int(min(10, finalCount)))
+                let visibleIndices = Array(UnsafeBufferPointer(start: visiblePtr, count: Int(min(10, finalCount))))
+                print("   Visible indices [0-9]: \(visibleIndices)")
+            }
+        }
+        
+        return finalCount
     }
     
     // MARK: - Simple CPU Distance Sorting
@@ -1423,30 +1535,8 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
     var visibleCount: UInt32 = 0
 
     if useGPUFrustumCulling {
-        // PHASE 0a: Reset visible count to 0
-        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            blitEncoder.fill(buffer: visibleSplatCountBuffer, range: 0..<visibleSplatCountBuffer.length, value: 0)
-            blitEncoder.endEncoding()
-        }
-
-        // PHASE 0b: GPU Frustum Culling
-        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
-            computeEncoder.setComputePipelineState(frustumCullPipeline)
-            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(visibleSplatCountBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(visibleSplatIndicesBuffer, offset: 0, index: 2)
-            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 3)
-            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 4)
-
-            let threadsPerGrid = MTLSize(width: splats.count, height: 1, depth: 1)
-            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
-            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-            computeEncoder.endEncoding()
-        }
-
-        // Read back visible count
-        let visibleCountPtr = visibleSplatCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
-        visibleCount = visibleCountPtr[0]
+        // PHASE 0: Deterministic GPU Frustum Culling (no atomic operations)
+        visibleCount = performDeterministicFrustumCulling(commandBuffer: commandBuffer, splatCount: splats.count)
     } else {
         visibleCount = UInt32(splats.count)
     }
@@ -1465,31 +1555,29 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
         computeEncoder.endEncoding()
     }
 
-    // PHASE 1: Compute Morton Codes (GPU-intensive)
-    // TEMPORARILY DISABLED: Test if Morton code precision causes remaining flickering
+    // PHASE 1: DISABLED Morton Codes (focus on frustum culling first)
     if useGPUFrustumCulling && visibleCount > 0 {
-        // Initialize mortonCodeBuffer with zero (disable spatial optimization)
+        // DISABLED: Initialize mortonCodeBuffer with zero (disable spatial optimization)
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
             blitEncoder.fill(buffer: mortonCodeBuffer, range: 0..<(Int(visibleCount) * MemoryLayout<UInt32>.stride), value: 0)
             blitEncoder.endEncoding()
         }
     } else {
-        // Initialize mortonCodeBuffer with zero (disable spatial optimization)
+        // DISABLED: Initialize mortonCodeBuffer with zero (disable spatial optimization)
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
             blitEncoder.fill(buffer: mortonCodeBuffer, range: 0..<(splats.count * MemoryLayout<UInt32>.stride), value: 0)
             blitEncoder.endEncoding()
         }
     }
 
-    // PHASE 2: GPU Radix Sort (VERY energy intensive)
-    // TEMPORARILY DISABLED: Test if radix sort non-determinism causes flickering
+    // PHASE 2: DISABLED GPU Radix Sort (focus on fixing frustum culling first)
     let sortCount = useGPUFrustumCulling ? Int(visibleCount) : splats.count
     if sortCount > 0 {
+        // DISABLED: Focus on frustum culling determinism first
         // performRadixSort(commandBuffer: commandBuffer, splatCount: sortCount)
         
         // Initialize sortedIndicesBuffer with identity mapping (no sorting)
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            // Create identity indices: [0, 1, 2, 3, ...]
             let bufferPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: sortCount)
             for i in 0..<sortCount {
                 bufferPtr[i] = UInt32(i)
@@ -1587,16 +1675,16 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
         // Debug: Print tile depth sorting timing
         if frameCount % 60 == 0 {
             let depthSortTime = CACurrentMediaTime() - depthSortStart
-            print("🔧 Tile Depth Sorting: \(String(format: "%.3f", depthSortTime * 1000))ms (\(tileUniforms.totalTiles) tiles)")
+//            print("🔧 Tile Depth Sorting: \(String(format: "%.3f", depthSortTime * 1000))ms (\(tileUniforms.totalTiles) tiles)")
             
             // Debug: Check for GPU non-determinism (stationary camera)
             let sortedPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: min(20, splats.count))
             let tilePtr = tileBuffer.contents().bindMemory(to: TileData.self, capacity: min(3, tileUniforms.totalTiles))
             
-            print("🧪 GPU Determinism Check (camera stationary):")
-            print("   Sorted indices [0-9]: \(Array(UnsafeBufferPointer(start: sortedPtr, count: 10)))")
-            print("   Tile[0]: count=\(tilePtr[0].count), splats=[\(tilePtr[0].splatIndices.0), \(tilePtr[0].splatIndices.1), \(tilePtr[0].splatIndices.2)]")
-            print("   Tile[1]: count=\(tilePtr[1].count), splats=[\(tilePtr[1].splatIndices.0), \(tilePtr[1].splatIndices.1), \(tilePtr[1].splatIndices.2)]")
+//            print("🧪 GPU Determinism Check (camera stationary):")
+//            print("   Sorted indices [0-9]: \(Array(UnsafeBufferPointer(start: sortedPtr, count: 10)))")
+//            print("   Tile[0]: count=\(tilePtr[0].count), splats=[\(tilePtr[0].splatIndices.0), \(tilePtr[0].splatIndices.1), \(tilePtr[0].splatIndices.2)]")
+//            print("   Tile[1]: count=\(tilePtr[1].count), splats=[\(tilePtr[1].splatIndices.0), \(tilePtr[1].splatIndices.1), \(tilePtr[1].splatIndices.2)]")
         }
     }
     
