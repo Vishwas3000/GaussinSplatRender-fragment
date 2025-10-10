@@ -58,7 +58,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     // GPU Frustum Culling buffers
     private var visibleSplatIndicesBuffer: MTLBuffer!
     private var visibleSplatCountBuffer: MTLBuffer!
-    private var useGPUFrustumCulling: Bool = true  // Toggle for A/B testing
+    private var useGPUFrustumCulling: Bool = false  // DISABLED: Test if atomic operations cause flickering
     
     // Simple CPU Sorting (Energy Efficient)
     private var useHybridSorting: Bool = false  // Enable simple CPU distance sorting
@@ -465,25 +465,25 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         }
         
         // 3. Dispersed clusters in different regions (only add if under limit)
-        let clusterPositions = [
-            (center: SIMD3<Float>(-12, 0, 0), box: (min: SIMD3<Float>(-15, -3, -3), max: SIMD3<Float>(-9, 3, 3))),
-            (center: SIMD3<Float>(12, 0, 0), box: (min: SIMD3<Float>(9, -3, -3), max: SIMD3<Float>(15, 3, 3)))
-        ]
-        
-        for cluster in clusterPositions {
-            if allSplats.count < maxSplatCount {
-                let remainingCount = min(clusterCount, maxSplatCount - allSplats.count)
-                let clusterSplats = GaussianSplatGenerator.generateSplatClusters(
-                    clusterCount: 10, // Reduced cluster count
-                    splatsPerCluster: max(1, remainingCount / 10),
-                    boundingBox: cluster.box,
-                    viewMatrix: viewMatrix,
-                    projectionMatrix: projectionMatrix,
-                    scaleMultiplier: splatScaleMultiplier
-                )
-                allSplats.append(contentsOf: clusterSplats)
-            }
-        }
+//        let clusterPositions = [
+//            (center: SIMD3<Float>(-12, 0, 0), box: (min: SIMD3<Float>(-15, -3, -3), max: SIMD3<Float>(-9, 3, 3))),
+//            (center: SIMD3<Float>(12, 0, 0), box: (min: SIMD3<Float>(9, -3, -3), max: SIMD3<Float>(15, 3, 3)))
+//        ]
+//        
+//        for cluster in clusterPositions {
+//            if allSplats.count < maxSplatCount {
+//                let remainingCount = min(clusterCount, maxSplatCount - allSplats.count)
+//                let clusterSplats = GaussianSplatGenerator.generateSplatClusters(
+//                    clusterCount: 10, // Reduced cluster count
+//                    splatsPerCluster: max(1, remainingCount / 10),
+//                    boundingBox: cluster.box,
+//                    viewMatrix: viewMatrix,
+//                    projectionMatrix: projectionMatrix,
+//                    scaleMultiplier: splatScaleMultiplier
+//                )
+//                allSplats.append(contentsOf: clusterSplats)
+//            }
+//        }
         
         // Ensure we don't exceed maxSplatCount
         if allSplats.count > maxSplatCount {
@@ -1466,42 +1466,36 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
     }
 
     // PHASE 1: Compute Morton Codes (GPU-intensive)
+    // TEMPORARILY DISABLED: Test if Morton code precision causes remaining flickering
     if useGPUFrustumCulling && visibleCount > 0 {
-        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
-            computeEncoder.setComputePipelineState(mortonCodeVisiblePipeline)
-            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(visibleSplatIndicesBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(mortonCodeBuffer, offset: 0, index: 2)
-            computeEncoder.setBuffer(sortedIndicesBuffer, offset: 0, index: 3)
-            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 4)
-            var visibleCountCopy = visibleCount
-            computeEncoder.setBytes(&visibleCountCopy, length: MemoryLayout<UInt32>.stride, index: 5)
-
-            let threadsPerGrid = MTLSize(width: Int(visibleCount), height: 1, depth: 1)
-            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
-            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-            computeEncoder.endEncoding()
+        // Initialize mortonCodeBuffer with zero (disable spatial optimization)
+        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+            blitEncoder.fill(buffer: mortonCodeBuffer, range: 0..<(Int(visibleCount) * MemoryLayout<UInt32>.stride), value: 0)
+            blitEncoder.endEncoding()
         }
     } else {
-        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
-            computeEncoder.setComputePipelineState(mortonCodePipeline)
-            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(mortonCodeBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(sortedIndicesBuffer, offset: 0, index: 2)
-            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 3)
-            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 4)
-
-            let threadsPerGrid = MTLSize(width: splats.count, height: 1, depth: 1)
-            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
-            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-            computeEncoder.endEncoding()
+        // Initialize mortonCodeBuffer with zero (disable spatial optimization)
+        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+            blitEncoder.fill(buffer: mortonCodeBuffer, range: 0..<(splats.count * MemoryLayout<UInt32>.stride), value: 0)
+            blitEncoder.endEncoding()
         }
     }
 
     // PHASE 2: GPU Radix Sort (VERY energy intensive)
+    // TEMPORARILY DISABLED: Test if radix sort non-determinism causes flickering
     let sortCount = useGPUFrustumCulling ? Int(visibleCount) : splats.count
     if sortCount > 0 {
-        performRadixSort(commandBuffer: commandBuffer, splatCount: sortCount)
+        // performRadixSort(commandBuffer: commandBuffer, splatCount: sortCount)
+        
+        // Initialize sortedIndicesBuffer with identity mapping (no sorting)
+        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+            // Create identity indices: [0, 1, 2, 3, ...]
+            let bufferPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: sortCount)
+            for i in 0..<sortCount {
+                bufferPtr[i] = UInt32(i)
+            }
+            blitEncoder.endEncoding()
+        }
     }
 
     // PHASE 3: Clear Tiles
@@ -1556,10 +1550,12 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
             computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 5)
             computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 6)
 
-            let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
+            // FIXED: Linear dispatch to ensure exactly one thread per tile (prevent race conditions)
+            let totalTiles = Int(tileUniforms.tilesPerRow) * Int(tileUniforms.tilesPerColumn)
+            let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
             let threadgroupsPerGrid = MTLSize(
-                width: (Int(tileUniforms.tilesPerRow) + 7) / 8,
-                height: (Int(tileUniforms.tilesPerColumn) + 7) / 8,
+                width: (totalTiles + 63) / 64,
+                height: 1,
                 depth: 1
             )
             computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
@@ -1592,6 +1588,15 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
         if frameCount % 60 == 0 {
             let depthSortTime = CACurrentMediaTime() - depthSortStart
             print("🔧 Tile Depth Sorting: \(String(format: "%.3f", depthSortTime * 1000))ms (\(tileUniforms.totalTiles) tiles)")
+            
+            // Debug: Check for GPU non-determinism (stationary camera)
+            let sortedPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: min(20, splats.count))
+            let tilePtr = tileBuffer.contents().bindMemory(to: TileData.self, capacity: min(3, tileUniforms.totalTiles))
+            
+            print("🧪 GPU Determinism Check (camera stationary):")
+            print("   Sorted indices [0-9]: \(Array(UnsafeBufferPointer(start: sortedPtr, count: 10)))")
+            print("   Tile[0]: count=\(tilePtr[0].count), splats=[\(tilePtr[0].splatIndices.0), \(tilePtr[0].splatIndices.1), \(tilePtr[0].splatIndices.2)]")
+            print("   Tile[1]: count=\(tilePtr[1].count), splats=[\(tilePtr[1].splatIndices.0), \(tilePtr[1].splatIndices.1), \(tilePtr[1].splatIndices.2)]")
         }
     }
     

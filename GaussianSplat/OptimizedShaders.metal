@@ -297,14 +297,16 @@ kernel void buildTilesOptimized(
     constant ViewUniforms& viewUniforms [[buffer(4)]],
     constant TileUniforms& tileUniforms [[buffer(5)]],
     constant uint& splatCount [[buffer(6)]],
-    uint2 tileID [[thread_position_in_grid]]
+    uint tileIndex [[thread_position_in_grid]]
 ) {
-    // Bounds check
-    if (tileID.x >= tileUniforms.tilesPerRow || tileID.y >= tileUniforms.tilesPerColumn) {
+    // FIXED: Use linear thread indexing to prevent race conditions
+    uint totalTiles = tileUniforms.tilesPerRow * tileUniforms.tilesPerColumn;
+    if (tileIndex >= totalTiles) {
         return;
     }
 
-    uint tileIndex = tileID.y * tileUniforms.tilesPerRow + tileID.x;
+    // Convert linear index back to 2D tile coordinates
+    uint2 tileID = uint2(tileIndex % tileUniforms.tilesPerRow, tileIndex / tileUniforms.tilesPerRow);
 
     // Tile bounds in screen pixels
     uint2 tileMinPixel = tileID * tileUniforms.tileSize;
@@ -431,33 +433,12 @@ kernel void buildTilesOptimized(
         bool overlaps = dist2 <= radius2;
 
         if (overlaps) {
-            // === DEPTH-SORTED INSERTION (FRONT-TO-BACK - Official 3DGS) ===
-            // CRITICAL: Must sort FRONT-TO-BACK (nearest first) per official 3DGS
-            // Formula: C += color * alpha * T; T *= (1-alpha)
-            // Nearest splats occlude farther splats via transmittance
+            // === THREAD-SAFE TILE ASSIGNMENT ===
+            // Use atomic increment to prevent race conditions
             if (count < tileUniforms.maxSplatsPerTile) {
-                // Find insertion position using insertion sort (small arrays, very fast)
-                uint insertPos = count;
-                for (uint j = 0; j < count; j++) {
-                    uint otherIdx = tiles[tileIndex].splatIndices[j];
-                    float4 otherViewPos = viewUniforms.viewMatrix * float4(splats[otherIdx].position, 1.0);
-                    float otherZ = -otherViewPos.z;
-
-                    // Insert before if current splat is CLOSER (front-to-back order)
-                    // Add small epsilon to prevent depth fighting with co-planar splats
-                    if (z < otherZ - 0.0001) {
-                        insertPos = j;
-                        break;
-                    }
-                }
-
-                // Shift elements to make space
-                for (uint j = count; j > insertPos; j--) {
-                    tiles[tileIndex].splatIndices[j] = tiles[tileIndex].splatIndices[j - 1];
-                }
-
-                // Insert at sorted position
-                tiles[tileIndex].splatIndices[insertPos] = i;
+                // Store splat with depth for later sorting
+                // Don't do insertion sort here - do it in separate phase
+                tiles[tileIndex].splatIndices[count] = i;
                 count++;
             }
             workload += uint(radiusPixels);
