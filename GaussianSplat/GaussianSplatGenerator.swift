@@ -224,6 +224,5 @@ extension GaussianSplatGenerator {
                 depth: viewSpacePos.z
             )
         }
-        splats.sort()
     }
 }

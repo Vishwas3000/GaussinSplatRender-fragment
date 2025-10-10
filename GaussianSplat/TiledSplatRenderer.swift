@@ -28,6 +28,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var buildTilesOptimizedPipeline: MTLComputePipelineState!
     private var buildTilesVisiblePipeline: MTLComputePipelineState!     // NEW!
     private var buildTilesPipeline: MTLComputePipelineState!            // Original tile building
+    private var sortTileDepthPipeline: MTLComputePipelineState!         // Depth sorting for stability
 
     // Render pipeline for fullscreen pass
     private var renderPipeline: MTLRenderPipelineState!
@@ -60,7 +61,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var useGPUFrustumCulling: Bool = true  // Toggle for A/B testing
     
     // Simple CPU Sorting (Energy Efficient)
-    private var useHybridSorting: Bool = true  // Enable simple CPU distance sorting
+    private var useHybridSorting: Bool = false  // Enable simple CPU distance sorting
 
     // Splat data
     private var splats: [GaussianSplat] = []
@@ -188,7 +189,8 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
               let radixScatterFunction = library.makeFunction(name: "radixSortScatter"),
               let buildTilesFunction = library.makeFunction(name: "buildTiles"),
               let buildOptimizedFunction = library.makeFunction(name: "buildTilesOptimized"),
-              let buildVisibleFunction = library.makeFunction(name: "buildTilesWithVisibleList") else {
+              let buildVisibleFunction = library.makeFunction(name: "buildTilesWithVisibleList"),
+              let sortDepthFunction = library.makeFunction(name: "sortTileDepth") else {
             fatalError("Could not find optimized shader functions")
         }
 
@@ -201,6 +203,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             buildTilesPipeline = try device.makeComputePipelineState(function: buildTilesFunction)
             buildTilesOptimizedPipeline = try device.makeComputePipelineState(function: buildOptimizedFunction)
             buildTilesVisiblePipeline = try device.makeComputePipelineState(function: buildVisibleFunction)
+            sortTileDepthPipeline = try device.makeComputePipelineState(function: sortDepthFunction)
         } catch {
             fatalError("Could not create optimized pipelines: \(error)")
         }
@@ -1561,6 +1564,34 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
             )
             computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
             computeEncoder.endEncoding()
+        }
+    }
+    
+    // PHASE 5: Tile Depth Sorting (NEW - stability fix for dense areas)
+    // Sort splats within each tile by depth to eliminate flickering
+    // while preserving Morton code spatial optimization benefits
+    let depthSortStart = CACurrentMediaTime()
+    if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+        computeEncoder.setComputePipelineState(sortTileDepthPipeline)
+        computeEncoder.setBuffer(tileBuffer, offset: 0, index: 0)
+        computeEncoder.setBuffer(splatBuffer, offset: 0, index: 1)
+        computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 2)
+        computeEncoder.setBuffer(tileUniformsBuffer, offset: 0, index: 3)
+        
+        // Process each tile independently for parallel execution
+        let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
+        let threadgroupsPerGrid = MTLSize(
+            width: (tileUniforms.totalTiles + 63) / 64,
+            height: 1, 
+            depth: 1
+        )
+        computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+        computeEncoder.endEncoding()
+        
+        // Debug: Print tile depth sorting timing
+        if frameCount % 60 == 0 {
+            let depthSortTime = CACurrentMediaTime() - depthSortStart
+            print("🔧 Tile Depth Sorting: \(String(format: "%.3f", depthSortTime * 1000))ms (\(tileUniforms.totalTiles) tiles)")
         }
     }
     
