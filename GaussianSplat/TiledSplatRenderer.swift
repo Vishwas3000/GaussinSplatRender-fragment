@@ -878,11 +878,6 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             let predicates = Array(UnsafeBufferPointer(start: predicatesPtr, count: min(10, splatCount)))
             print("   Visibility predicates [0-9]: \(predicates)")
             
-            // Debug: Check prefix sums
-            let prefixPtr = prefixSumsBuffer.contents().bindMemory(to: UInt32.self, capacity: min(10, splatCount))
-            let prefixSums = Array(UnsafeBufferPointer(start: prefixPtr, count: min(10, splatCount)))
-            print("   Prefix sums [0-9]: \(prefixSums)")
-            
             // Debug: Check visible indices
             if finalCount > 0 {
                 let visiblePtr = visibleSplatIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: Int(min(10, finalCount)))
@@ -1555,25 +1550,45 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
         computeEncoder.endEncoding()
     }
 
-    // PHASE 1: DISABLED Morton Codes (focus on frustum culling first)
+    // PHASE 1: Compute Morton Codes (fixed-point deterministic)
     if useGPUFrustumCulling && visibleCount > 0 {
-        // DISABLED: Initialize mortonCodeBuffer with zero (disable spatial optimization)
-        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            blitEncoder.fill(buffer: mortonCodeBuffer, range: 0..<(Int(visibleCount) * MemoryLayout<UInt32>.stride), value: 0)
-            blitEncoder.endEncoding()
+        // Compute Morton codes for visible splats only
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(mortonCodeVisiblePipeline)
+            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(visibleSplatIndicesBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(mortonCodeBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(sortedIndicesBuffer, offset: 0, index: 3)
+            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 4)
+            var visibleCountCopy = visibleCount
+            computeEncoder.setBytes(&visibleCountCopy, length: MemoryLayout<UInt32>.stride, index: 5)
+            
+            let threadsPerGrid = MTLSize(width: Int(visibleCount), height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
+            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
         }
     } else {
-        // DISABLED: Initialize mortonCodeBuffer with zero (disable spatial optimization)
-        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            blitEncoder.fill(buffer: mortonCodeBuffer, range: 0..<(splats.count * MemoryLayout<UInt32>.stride), value: 0)
-            blitEncoder.endEncoding()
+        // Compute Morton codes for all splats
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            computeEncoder.setComputePipelineState(mortonCodePipeline)
+            computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(mortonCodeBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(sortedIndicesBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 3)
+            computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 4)
+            
+            let threadsPerGrid = MTLSize(width: splats.count, height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
+            computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
         }
     }
 
-    // PHASE 2: DISABLED GPU Radix Sort (focus on fixing frustum culling first)
+    // PHASE 2: DISABLED GPU Radix Sort (focus on Morton codes first)
     let sortCount = useGPUFrustumCulling ? Int(visibleCount) : splats.count
     if sortCount > 0 {
-        // DISABLED: Focus on frustum culling determinism first
+        // DISABLED: Focus on Morton code determinism first
         // performRadixSort(commandBuffer: commandBuffer, splatCount: sortCount)
         
         // Initialize sortedIndicesBuffer with identity mapping (no sorting)
@@ -1583,6 +1598,17 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
                 bufferPtr[i] = UInt32(i)
             }
             blitEncoder.endEncoding()
+        }
+        
+        // Debug: Print Morton code results every 60 frames
+        if frameCount % 60 == 0 && sortCount > 0 {
+            let mortonPtr = mortonCodeBuffer.contents().bindMemory(to: UInt32.self, capacity: min(10, sortCount))
+            let mortonCodes = Array(UnsafeBufferPointer(start: mortonPtr, count: min(10, sortCount)))
+            print("🔢 Morton Codes [0-9]: \(mortonCodes)")
+            
+            let sortedPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: min(10, sortCount))
+            let sortedIndices = Array(UnsafeBufferPointer(start: sortedPtr, count: min(10, sortCount)))
+            print("📋 Sorted Indices [0-9]: \(sortedIndices) (identity mapping)")
         }
     }
 
