@@ -7,11 +7,11 @@ struct GaussianSplat {
     let covariance3D_B: SIMD2<Float> // Store remaining elements: [yz, zz]
     let color: SIMD3<UInt8>
     let opacity: UInt8
-    let depth: Float
+    var depth: Float
     
-    init(position: SIMD3<Float>, 
+    init(position: SIMD3<Float>,
          covariance3D: simd_float3x3,
-         color: SIMD3<Float>, 
+         color: SIMD3<Float>,
          opacity: Float,
          depth: Float) {
         self.position = position
@@ -68,10 +68,10 @@ struct GaussianSplat {
 }
 
 struct TileData {
-    var count: UInt32           // Number of splats assigned to this tile
-    var rejectedCount: UInt32   // Number of splats rejected (culled) from this tile
-    var workloadEstimate: UInt32 // Estimated GPU workload (for performance visualization)
-    var maxDepth: UInt32        // Maximum depth of splats in this tile (for debugging)
+    var count: UInt32
+    var rejectedCount: UInt32
+    var workloadEstimate: UInt32
+    var maxDepth: UInt32
     var splatIndices: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
                        UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
                        UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
@@ -79,7 +79,7 @@ struct TileData {
                        UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
                        UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
                        UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
-                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32) // Array of splat indices (64 elements)
+                       UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)
 
     init() {
         self.count = 0
@@ -106,10 +106,10 @@ struct ViewUniforms {
     let screenSize: SIMD2<Float>
     let padding: SIMD2<Float>
     
-    init(viewMatrix: simd_float4x4, 
-         projectionMatrix: simd_float4x4, 
-         cameraPosition: SIMD3<Float>, 
-         screenSize: SIMD2<Float>, 
+    init(viewMatrix: simd_float4x4,
+         projectionMatrix: simd_float4x4,
+         cameraPosition: SIMD3<Float>,
+         screenSize: SIMD2<Float>,
          time: Float = 0) {
         self.viewMatrix = viewMatrix
         self.projectionMatrix = projectionMatrix
@@ -200,7 +200,6 @@ func createRandom3DCovariance(scale: Float = 1.0) -> simd_float3x3 {
         SIMD3<Float>(0, 0, finalScaleZ)
     )
     
-    // Combine: R * S * R^T to create 3D covariance matrix
     let temp = rotation * scaleMatrix
     return temp * rotation.transpose
 }

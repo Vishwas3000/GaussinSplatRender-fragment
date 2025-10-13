@@ -39,7 +39,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var splatCountBuffer: MTLBuffer!
     
     // Splat data
-    private var splats: [GaussianSplat] = []
+    var splats: [GaussianSplat] = []
     private var tileUniforms: TileUniforms!
     
     // Orbital camera state
@@ -1105,3 +1105,86 @@ func createPerspectiveMatrix(fovy: Float, aspect: Float, near: Float, far: Float
         SIMD4<Float>(0, 0, (2 * far * near) / (near - far), 0)
     )
 }
+
+// MARK: - Updated loadFromFile Method for TiledSplatRenderer
+extension TiledSplatRenderer {
+    
+    func loadFromFile(url: URL) {
+        print("🚀 LOADING GAUSSIAN SPLAT FILE")
+        
+        do {
+            // Parse SPZ file using new Structure of Arrays parser
+            let parseResult = try SPZParser.parse(fileURL: url)
+            
+            print("\n📊 File Statistics:")
+            print("   Total splats: \(parseResult.splats.count)")
+            print("   Version: \(parseResult.header.version)")
+            print("   SH Degree: \(parseResult.header.shDegree)")
+            print("   Fractional Bits: \(parseResult.header.fractionalBits)")
+            
+            print("\n📐 Scene Bounds:")
+            print("   Min: \(parseResult.bounds.min)")
+            print("   Max: \(parseResult.bounds.max)")
+            
+            let center = (parseResult.bounds.min + parseResult.bounds.max) / 2.0
+            let size = parseResult.bounds.max - parseResult.bounds.min
+            
+            print("   Center: \(center)")
+            print("   Size: \(size)")
+            
+            // Convert to expanded GaussianSplat format for rendering
+            print(" Converting to render format...")
+            var loadedSplats = parseResult.splats.map {
+                $0.toGaussianSplat()
+            }
+            
+            print("Converted \(loadedSplats.count) splats")
+            
+            // Adjust camera to fit scene
+            cameraTarget = center
+            let maxDimension = max(size.x, max(size.y, size.z))
+            cameraDistance = maxDimension * 2.0
+            updateCameraPosition()
+            
+            print("   Camera distance: \(String(format: "%.2f", cameraDistance))")
+            
+            // Update depths for proper back-to-front rendering
+            let viewMatrix = createViewMatrix()
+            GaussianSplatGenerator.updateSplatDepths(splats: &loadedSplats, viewMatrix: viewMatrix)
+            
+            // Update scene
+            self.splats = loadedSplats
+            setupBuffers()
+            
+            // Sample some splats for verification
+            print("\n🔍 Sample Splats (first 3):")
+            for i in 0..<min(3, loadedSplats.count) {
+                let splat = loadedSplats[i]
+                print("   Splat \(i):")
+                print("     Position: (\(String(format: "%.2f", splat.position.x)), \(String(format: "%.2f", splat.position.y)), \(String(format: "%.2f", splat.position.z)))")
+                print("     Color: (\(splat.color.x), \(splat.color.y), \(splat.color.z))")
+                print("     Opacity: \(splat.opacity)")
+                print("     Depth: \(String(format: "%.2f", splat.depth))")
+            }
+            
+            print("\n✅ Successfully loaded \(splats.count) splats!")
+            print(String(repeating: "=", count: 60) + "\n")
+            
+        } catch SPZParser.SPZError.invalidFile {
+            print("\n❌ ERROR: Invalid SPZ file format")
+            
+        } catch SPZParser.SPZError.decompressionFailed {
+            print("\n❌ ERROR: Failed to decompress GZIP data")
+            
+        } catch SPZParser.SPZError.invalidHeader {
+            print("\n❌ ERROR: Invalid or unsupported SPZ header")
+            
+        } catch SPZParser.SPZError.dataSizeMismatch {
+            print("\n❌ ERROR: SPZ data size mismatch")
+            
+        } catch {
+            print("\n❌ ERROR: \(error)")
+        }
+    }
+}
+

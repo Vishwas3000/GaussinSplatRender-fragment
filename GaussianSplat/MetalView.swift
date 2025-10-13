@@ -3,6 +3,8 @@ import MetalKit
 import UIKit
 
 struct MetalView: UIViewRepresentable {
+    @ObservedObject var viewModel: ContentViewModel
+    
     func makeUIView(context: Context) -> MTKView {
         let metalView = MTKView()
         
@@ -20,6 +22,10 @@ struct MetalView: UIViewRepresentable {
         
         context.coordinator.renderer = renderer
         
+        DispatchQueue.main.async {
+            viewModel.renderer = renderer
+        }
+        
         // Add gesture recognizers
         setupGestures(metalView: metalView, renderer: renderer)
         
@@ -36,14 +42,17 @@ struct MetalView: UIViewRepresentable {
     private func setupGestures(metalView: MTKView, renderer: TiledSplatRenderer) {
         // Pan gesture for rotation
         let panGesture = UIPanGestureRecognizer(target: renderer, action: #selector(TiledSplatRenderer.handlePan(_:)))
+        panGesture.delegate = renderer
         metalView.addGestureRecognizer(panGesture)
         
         // Pinch gesture for zoom
         let pinchGesture = UIPinchGestureRecognizer(target: renderer, action: #selector(TiledSplatRenderer.handlePinch(_:)))
+        pinchGesture.delegate = renderer
         metalView.addGestureRecognizer(pinchGesture)
         
         // Rotation gesture
         let rotationGesture = UIRotationGestureRecognizer(target: renderer, action: #selector(TiledSplatRenderer.handleRotation(_:)))
+        rotationGesture.delegate = renderer
         metalView.addGestureRecognizer(rotationGesture)
         
         // Double tap gesture for debug mode cycling
@@ -51,10 +60,8 @@ struct MetalView: UIViewRepresentable {
         doubleTapGesture.numberOfTapsRequired = 2
         metalView.addGestureRecognizer(doubleTapGesture)
         
-        // Allow simultaneous gestures
-        panGesture.delegate = renderer
-        pinchGesture.delegate = renderer
-        rotationGesture.delegate = renderer
+        // Enable multi-touch
+        metalView.isMultipleTouchEnabled = true
     }
     
     class Coordinator {
