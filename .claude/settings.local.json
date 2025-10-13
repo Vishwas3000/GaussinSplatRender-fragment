@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "Read(//tmp/**)",
+      "WebFetch(domain:arxiv.org)"
     ],
     "deny": [],
     "ask": []
