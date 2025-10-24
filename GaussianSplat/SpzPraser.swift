@@ -350,6 +350,15 @@ class SPZParser {
             
             let opacity = Float(alphas[i]) / 255.0
             
+            // 🔍 DEBUG: Log first 3 splats for validation (reduced logging)
+            if i < 3 {
+                print("\n🔍 SPZ Splat \(i) Raw Data:")
+                print("   Position: (\(String(format: "%.4f", x)), \(String(format: "%.4f", y)), \(String(format: "%.4f", z)))")
+                print("   Color: (\(String(format: "%.3f", color.x)), \(String(format: "%.3f", color.y)), \(String(format: "%.3f", color.z)))")
+                print("   Opacity: \(String(format: "%.3f", opacity))")
+                print("   Scale: (\(String(format: "%.4f", scale.x)), \(String(format: "%.4f", scale.y)), \(String(format: "%.4f", scale.z)))")
+            }
+            
             // Create simple splat (no packing!)
             let splat = SplatData(
                 position: position,
@@ -362,6 +371,52 @@ class SPZParser {
             
             splats.append(splat)
         }
+        
+        // 📊 VALIDATION: Analyze parsed data ranges for quality check
+        print("\n📊 SPZ Data Validation Summary:")
+        
+        var positionBounds = (min: SIMD3<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude),
+                             max: SIMD3<Float>(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude))
+        var colorBounds = (min: SIMD3<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude),
+                          max: SIMD3<Float>(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude))
+        var scaleBounds = (min: SIMD3<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude),
+                          max: SIMD3<Float>(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude))
+        var opacityBounds = (min: Float.greatestFiniteMagnitude, max: -Float.greatestFiniteMagnitude)
+        
+        var invalidCount = 0
+        var zeroOpacityCount = 0
+        var blackSplatCount = 0
+        
+        for splat in splats {
+            // Track bounds
+            positionBounds.min = min(positionBounds.min, splat.position)
+            positionBounds.max = max(positionBounds.max, splat.position)
+            colorBounds.min = min(colorBounds.min, splat.color)
+            colorBounds.max = max(colorBounds.max, splat.color)
+            scaleBounds.min = min(scaleBounds.min, splat.scale)
+            scaleBounds.max = max(scaleBounds.max, splat.scale)
+            opacityBounds.min = min(opacityBounds.min, splat.opacity)
+            opacityBounds.max = max(opacityBounds.max, splat.opacity)
+            
+            // Count issues
+            if splat.opacity <= 0.01 { zeroOpacityCount += 1 }
+            if length(splat.color) < 0.1 { blackSplatCount += 1 }
+            if splat.position.x.isNaN || splat.position.y.isNaN || splat.position.z.isNaN ||
+               splat.color.x.isNaN || splat.color.y.isNaN || splat.color.z.isNaN ||
+               splat.scale.x.isNaN || splat.scale.y.isNaN || splat.scale.z.isNaN ||
+               splat.opacity.isNaN {
+                invalidCount += 1
+            }
+        }
+        
+        print("   Position Range: (\(String(format: "%.3f", positionBounds.min.x)), \(String(format: "%.3f", positionBounds.min.y)), \(String(format: "%.3f", positionBounds.min.z))) to (\(String(format: "%.3f", positionBounds.max.x)), \(String(format: "%.3f", positionBounds.max.y)), \(String(format: "%.3f", positionBounds.max.z)))")
+        print("   Color Range: (\(String(format: "%.3f", colorBounds.min.x)), \(String(format: "%.3f", colorBounds.min.y)), \(String(format: "%.3f", colorBounds.min.z))) to (\(String(format: "%.3f", colorBounds.max.x)), \(String(format: "%.3f", colorBounds.max.y)), \(String(format: "%.3f", colorBounds.max.z)))")
+        print("   Scale Range: (\(String(format: "%.4f", scaleBounds.min.x)), \(String(format: "%.4f", scaleBounds.min.y)), \(String(format: "%.4f", scaleBounds.min.z))) to (\(String(format: "%.4f", scaleBounds.max.x)), \(String(format: "%.4f", scaleBounds.max.y)), \(String(format: "%.4f", scaleBounds.max.z)))")
+        print("   Opacity Range: \(String(format: "%.3f", opacityBounds.min)) to \(String(format: "%.3f", opacityBounds.max))")
+        print("   Quality Issues:")
+        print("     Invalid (NaN) splats: \(invalidCount)")
+        print("     Near-zero opacity splats: \(zeroOpacityCount) (\(String(format: "%.1f", Float(zeroOpacityCount) / Float(numPoints) * 100))%)")
+        print("     Near-black splats: \(blackSplatCount) (\(String(format: "%.1f", Float(blackSplatCount) / Float(numPoints) * 100))%)")
         
         return splats
     }
@@ -420,6 +475,32 @@ extension SPZParser.SplatData {
     func toGaussianSplat() -> GaussianSplat {
         // Compute covariance from scale and rotation
         let covariance = computeCovariance(scale: scale, rotation: rotation)
+        
+        return GaussianSplat(
+            position: position,
+            covariance3D: covariance,
+            color: color,
+            opacity: opacity,
+            depth: depth
+        )
+    }
+    
+    /// Convert to GaussianSplat with debug logging for first few splats
+    func toGaussianSplat(index: Int) -> GaussianSplat {
+        // Compute covariance from scale and rotation
+        let covariance = computeCovariance(scale: scale, rotation: rotation)
+        
+        // 🔍 DEBUG: Log SPZ→GaussianSplat conversion for first 3 splats (reduced logging)
+        if index < 3 {
+            print("\n🔍 SPZ→GaussianSplat Conversion \(index):")
+            print("   Position: (\(String(format: "%.4f", position.x)), \(String(format: "%.4f", position.y)), \(String(format: "%.4f", position.z)))")
+            print("   Color: (\(String(format: "%.3f", color.x)), \(String(format: "%.3f", color.y)), \(String(format: "%.3f", color.z)))")
+            print("   Opacity: \(String(format: "%.3f", opacity))")
+            
+            // Check covariance determinant
+            let determinant = covariance.determinant
+            print("   Covariance Determinant: \(String(format: "%.6f", determinant)) \(determinant <= 0 ? "⚠️ NON-POSITIVE!" : "✓")")
+        }
         
         return GaussianSplat(
             position: position,

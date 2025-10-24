@@ -16,6 +16,15 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     
+    // Reference to the MTKView for forcing redraws
+    private weak var metalView: MTKView?
+    
+    // Track if SPZ data is loaded to prevent overwriting with random scene
+    private var spzDataLoaded = false
+    
+    // Performance optimization: Limit rendering for large datasets
+    private let maxRenderSplats = 50000  // Reasonable limit for smooth performance
+    
     // Compute pipelines - Optimized Morton Code + Radix Sort + Frustum Culling
     private var preprocessSplatsPipeline: MTLComputePipelineState!
     // frustumCullPipeline removed - using deterministic approach instead
@@ -152,8 +161,35 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         super.init()
         
         setupPipelines()
-        generateRandomScene()
+        
+        // 🚀 AUTO-LOAD SPZ: Load butterfly.spz directly on startup
+        autoLoadSPZFile()
+        
         updateCameraPosition() // Initialize camera position
+    }
+    
+    private func autoLoadSPZFile() {
+        // Load butterfly.spz directly from app bundle
+        guard let bundlePath = Bundle.main.url(forResource: "butterfly", withExtension: "spz") else {
+            print("❌ AUTO-LOAD: butterfly.spz not found in app bundle!")
+            print("   Make sure butterfly.spz is added to the Xcode project and included in the bundle")
+            generateRandomScene()
+            return
+        }
+        
+        print("🚀 AUTO-LOADING: Found butterfly.spz in app bundle at \(bundlePath.path)")
+        print("   File size: \(getFileSize(url: bundlePath)) bytes")
+        
+        loadFromFile(url: bundlePath)
+    }
+    
+    private func getFileSize(url: URL) -> Int64 {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            return attributes[.size] as? Int64 ?? 0
+        } catch {
+            return 0
+        }
     }
     
     private func setupPipelines() {
@@ -412,14 +448,39 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     
     // MARK: - Scene Configuration
     
+    func setMetalView(_ view: MTKView) {
+        metalView = view
+        print("🔧 MetalView reference set for forced redraws")
+    }
+    
+    private func forceRedraw() {
+        if let metalView = metalView {
+            DispatchQueue.main.async {
+                metalView.setNeedsDisplay()
+                metalView.isPaused = false
+                print("🔄 Forced MetalView redraw after scene change")
+            }
+        }
+    }
+    
+    private func getEffectiveRenderCount() -> Int {
+        let renderCount = min(splats.count, maxRenderSplats)
+        if splats.count > maxRenderSplats {
+            print("⚡ LOD ACTIVE: Rendering \(renderCount)/\(splats.count) splats (\(String(format: "%.1f", Float(renderCount)/Float(splats.count)*100))%)")
+        }
+        return renderCount
+    }
+    
     func setMaxSplatCount(_ count: Int) {
         maxSplatCount = max(100, min(count, 5000000)) // Clamp between 100 and 5M
-        generateRandomScene()
+        print("🔧 setMaxSplatCount(\(count)) called - maxSplatCount set to \(maxSplatCount)")
+        // Don't automatically generate random scene - let the init process handle scene loading
     }
     
     func setSplatScale(_ scale: Float) {
         splatScaleMultiplier = max(0.1, min(scale, 3.0)) // Clamp between 0.1 and 3.0
-        generateRandomScene()
+        print("🔧 setSplatScale(\(scale)) called - scale set to \(splatScaleMultiplier)")
+        // Don't automatically generate random scene - let the current scene persist
     }
     
     func getMaxSplatCount() -> Int {
@@ -433,6 +494,12 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     // MARK: - Scene Generation Functions
     
     private func generateRandomScene() {
+        if spzDataLoaded {
+            print("🚫 generateRandomScene() BLOCKED - SPZ data already loaded, preserving SPZ splats")
+            return
+        }
+        
+        print("🎲 generateRandomScene() - Creating random splats")
         // Create a diverse mix of different splat patterns with controlled count
         var allSplats: [GaussianSplat] = []
         
@@ -505,6 +572,18 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         self.splats = allSplats
         print("Generated \(splats.count) splats (max: \(maxSplatCount)) with scale multiplier: \(splatScaleMultiplier)")
         
+        // 🔍 RANDOM SPLAT DEBUG: Log first 3 random splats for comparison with SPZ
+        print("\n🔍 Random Splat Samples (for comparison):")
+        for i in 0..<min(3, allSplats.count) {
+            let splat = allSplats[i]
+            print("   Random Splat \(i):")
+            print("     Position: (\(String(format: "%.4f", splat.position.x)), \(String(format: "%.4f", splat.position.y)), \(String(format: "%.4f", splat.position.z)))")
+            print("     Color: (\(String(format: "%.3f", splat.floatColor.x)), \(String(format: "%.3f", splat.floatColor.y)), \(String(format: "%.3f", splat.floatColor.z)))")
+            print("     Opacity: \(String(format: "%.3f", splat.floatOpacity))")
+            print("     Depth: \(String(format: "%.3f", splat.depth))")
+            print("     Covariance Diagonal: (\(String(format: "%.4f", splat.covariance3DMatrix[0][0])), \(String(format: "%.4f", splat.covariance3DMatrix[1][1])), \(String(format: "%.4f", splat.covariance3DMatrix[2][2])))")
+        }
+        
         setupBuffers()
     }
     
@@ -557,25 +636,52 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     
     
     private func setupBuffers() {
+        print("\n🔧 BUFFER SETUP - Starting buffer recreation...")
+        print("   Target splat count: \(splats.count)")
+        
         // Create splat buffer
         let splatDataSize = splats.count * MemoryLayout<GaussianSplat>.stride
         splatBuffer = device.makeBuffer(bytes: splats, length: splatDataSize, options: .storageModeShared)
+        print("   ✓ Splat buffer created: \(splatDataSize) bytes")
 
         // Create preprocessed splat buffer
         let preprocessedDataSize = splats.count * MemoryLayout<PreprocessedSplat>.stride
         preprocessedSplatBuffer = device.makeBuffer(length: preprocessedDataSize, options: .storageModeShared)
+        print("   ✓ Preprocessed buffer created: \(preprocessedDataSize) bytes")
 
         // Create buffers for uniforms
         viewUniformsBuffer = device.makeBuffer(length: MemoryLayout<ViewUniforms>.stride, options: .storageModeShared)
         tileUniformsBuffer = device.makeBuffer(length: MemoryLayout<TileUniforms>.stride, options: .storageModeShared)
         splatCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
 
-        // Set splat count
+        // Set effective splat count (with LOD optimization)
+        let effectiveCount = getEffectiveRenderCount()
         let splatCountPtr = splatCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
-        splatCountPtr[0] = UInt32(splats.count)
+        splatCountPtr[0] = UInt32(effectiveCount)
+        print("   ✓ Splat count buffer set to: \(splatCountPtr[0]) (effective render count)")
+        
+        if effectiveCount < splats.count {
+            print("   ⚡ LOD Performance boost: Reduced from \(splats.count) to \(effectiveCount) splats")
+        }
 
         // Setup Morton code & radix sort buffers
         setupMortonBuffers()
+        
+        // 🔍 BUFFER VALIDATION: Verify the first few splats made it into the buffer
+        if let splatBuffer = splatBuffer {
+            let bufferPtr = splatBuffer.contents().bindMemory(to: GaussianSplat.self, capacity: splats.count)
+            print("\n🔍 Buffer Validation - First 3 splats in GPU buffer:")
+            for i in 0..<min(3, splats.count) {
+                let bufferSplat = bufferPtr[i]
+                print("   Buffer Splat \(i):")
+                print("     Position: (\(String(format: "%.4f", bufferSplat.position.x)), \(String(format: "%.4f", bufferSplat.position.y)), \(String(format: "%.4f", bufferSplat.position.z)))")
+                print("     Color: (\(bufferSplat.color.x), \(bufferSplat.color.y), \(bufferSplat.color.z))")
+                print("     Opacity: \(bufferSplat.opacity)")
+                print("     Depth: \(String(format: "%.3f", bufferSplat.depth))")
+            }
+        }
+        
+        print("🔧 BUFFER SETUP - Complete! All buffers recreated for \(splats.count) splats")
     }
 
     private func setupMortonBuffers() {
@@ -711,26 +817,13 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let y = cameraDistance * sin(cameraElevation)
         let z = cameraDistance * cos(cameraElevation) * sin(cameraAzimuth)
         
+        let oldPosition = cameraPosition
         cameraPosition = cameraTarget + SIMD3<Float>(x, y, z)
     }
     
     private func createViewMatrix() -> simd_float4x4 {
         // Create lookAt matrix: camera always looks at target
         let viewMatrix = createLookAtMatrix(eye: cameraPosition, target: cameraTarget, up: SIMD3<Float>(0, 1, 0))
-
-        // Debug: Print view matrix components periodically
-//        if frameCount % 60 == 0 {  // Every 60 frames (about once per second)
-//            print("\n=== View Matrix Debug (Frame \(frameCount)) ===")
-//            print("Camera Position: (\(String(format: "%.2f", cameraPosition.x)), \(String(format: "%.2f", cameraPosition.y)), \(String(format: "%.2f", cameraPosition.z)))")
-//            print("Camera Target: (\(String(format: "%.2f", cameraTarget.x)), \(String(format: "%.2f", cameraTarget.y)), \(String(format: "%.2f", cameraTarget.z)))")
-//            print("Azimuth: \(String(format: "%.1f", cameraAzimuth * 180 / Float.pi))°")
-//            print("Elevation: \(String(format: "%.1f", cameraElevation * 180 / Float.pi))°")
-//            print("\nView Matrix (column-major):")
-//            print("Col 0 (right):    [\(String(format: "%6.3f", viewMatrix[0][0])), \(String(format: "%6.3f", viewMatrix[0][1])), \(String(format: "%6.3f", viewMatrix[0][2]))]")
-//            print("Col 1 (up):       [\(String(format: "%6.3f", viewMatrix[1][0])), \(String(format: "%6.3f", viewMatrix[1][1])), \(String(format: "%6.3f", viewMatrix[1][2]))]")
-//            print("Col 2 (-forward): [\(String(format: "%6.3f", viewMatrix[2][0])), \(String(format: "%6.3f", viewMatrix[2][1])), \(String(format: "%6.3f", viewMatrix[2][2]))]")
-//            print("Col 3 (trans):    [\(String(format: "%6.3f", viewMatrix[3][0])), \(String(format: "%6.3f", viewMatrix[3][1])), \(String(format: "%6.3f", viewMatrix[3][2]))]")
-//        }
 
         return viewMatrix
     }
@@ -1456,10 +1549,11 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private func renderWithHybridPipeline(commandBuffer: MTLCommandBuffer) {
         let pipelineStartTime = CACurrentMediaTime()
         
-        // PHASE 1: CPU Sort ALL splats by distance (replaces GPU Morton + Radix sort)
-        performCPUSort()
+        // PHASE 1: CPU Sort DISABLED for debugging
+        // performCPUSort()
+        print("🚫 SORTING DISABLED - Using original splat order")
         
-        // PHASE 2: Preprocess Splats
+        // PHASE 2: Preprocess Splats (with LOD optimization)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
             computeEncoder.setComputePipelineState(preprocessSplatsPipeline)
             computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
@@ -1467,7 +1561,8 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 2)
             computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 3)
 
-            let threadsPerGrid = MTLSize(width: splats.count, height: 1, depth: 1)
+            let renderCount = getEffectiveRenderCount()
+            let threadsPerGrid = MTLSize(width: renderCount, height: 1, depth: 1)
             let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
             computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
             computeEncoder.endEncoding()
@@ -1532,7 +1627,7 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
         visibleCount = UInt32(splats.count)
     }
 
-    // PHASE 0c: Preprocess Splats
+    // PHASE 0c: Preprocess Splats (with LOD optimization)
     if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
         computeEncoder.setComputePipelineState(preprocessSplatsPipeline)
         computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
@@ -1540,7 +1635,8 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
         computeEncoder.setBuffer(viewUniformsBuffer, offset: 0, index: 2)
         computeEncoder.setBuffer(splatCountBuffer, offset: 0, index: 3)
 
-        let threadsPerGrid = MTLSize(width: splats.count, height: 1, depth: 1)
+        let renderCount = getEffectiveRenderCount()
+        let threadsPerGrid = MTLSize(width: renderCount, height: 1, depth: 1)
         let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
         computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
         computeEncoder.endEncoding()
@@ -1580,32 +1676,29 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
             computeEncoder.endEncoding()
         }
     }
+    
 
-    // PHASE 2: DISABLED Radix Sort (flickering detected - investigating)
+    // PHASE 2: DISABLED Radix Sort AND Morton Codes (debugging)
     let sortCount = useGPUFrustumCulling ? Int(visibleCount) : splats.count
     if sortCount > 0 {
         // OPTIMAL SOLUTION: Skip radix sorting entirely - Morton codes provide spatial locality
         // The tile building shaders can use Morton codes directly without requiring sorted splats
         
-        // Use identity mapping - no sorting needed!
-        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            let bufferPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: sortCount)
-            for i in 0..<sortCount {
-                bufferPtr[i] = UInt32(i)
-            }
-            blitEncoder.endEncoding()
-        }
+        // Use identity mapping - no sorting needed! (DISABLED for debugging)
+        // if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+        //     let bufferPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: sortCount)
+        //     for i in 0..<sortCount {
+        //         bufferPtr[i] = UInt32(i)
+        //     }
+        //     blitEncoder.endEncoding()
+        // }
+        print("🚫 IDENTITY MAPPING DISABLED - No index buffer manipulation")
         
-        // Debug: Show that Morton codes provide spatial optimization without sorting
+        // Debug: Morton codes and sorting completely disabled
         if frameCount % 60 == 0 && sortCount > 0 {
-            let mortonPtr = mortonCodeBuffer.contents().bindMemory(to: UInt32.self, capacity: min(10, sortCount))
-            let mortonCodes = Array(UnsafeBufferPointer(start: mortonPtr, count: min(10, sortCount)))
-            print("🔢 Morton Codes [0-9]: \(mortonCodes) (spatial locality)")
-            
-            let sortedPtr = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: min(10, sortCount))
-            let sortedIndices = Array(UnsafeBufferPointer(start: sortedPtr, count: min(10, sortCount)))
-            print("📋 Sorted Indices [0-9]: \(sortedIndices) (identity - NO SORTING NEEDED)")
-            print("✅ SPATIAL OPTIMIZATION: Morton codes provide locality without sorting overhead")
+            print("🚫 NO MORTON CODES - No sorting or spatial optimization")
+            print("📋 Splat Order: Original file order (0, 1, 2, 3, ...)")
+            print("✅ SIMPLIFIED PIPELINE: Direct rendering without any sorting")
         }
     }
 
@@ -1768,7 +1861,7 @@ func createPerspectiveMatrix(fovy: Float, aspect: Float, near: Float, far: Float
 extension TiledSplatRenderer {
     
     func loadFromFile(url: URL) {
-        print("🚀 LOADING GAUSSIAN SPLAT FILE")
+        print("🚀 LOADING GAUSSIAN SPLAT FILE: \(url)")
         
         do {
             // Parse SPZ file using new Structure of Arrays parser
@@ -1792,26 +1885,49 @@ extension TiledSplatRenderer {
             
             // Convert to expanded GaussianSplat format for rendering
             print(" Converting to render format...")
-            var loadedSplats = parseResult.splats.map {
-                $0.toGaussianSplat()
+            var loadedSplats = parseResult.splats.enumerated().map { (index, splatData) in
+                splatData.toGaussianSplat(index: index)
             }
             
             print("Converted \(loadedSplats.count) splats")
             
-            // Adjust camera to fit scene
+            // Adjust camera to fit scene - position camera to look at the splat cloud
             cameraTarget = center
             let maxDimension = max(size.x, max(size.y, size.z))
-            cameraDistance = maxDimension * 2.0
+            cameraDistance = maxDimension * 3.0  // Safe distance for viewing
+            
+            // Position camera to ensure positive depths (in front of splat cloud)
+            // Place camera along positive Z axis from the target
+            cameraAzimuth = Float.pi / 2.0      // 90 degrees - along Z axis  
+            cameraElevation = 0.0               // Level with center
             updateCameraPosition()
             
+            print("   Camera target: (\(String(format: "%.2f", cameraTarget.x)), \(String(format: "%.2f", cameraTarget.y)), \(String(format: "%.2f", cameraTarget.z)))")
             print("   Camera distance: \(String(format: "%.2f", cameraDistance))")
+            print("   Camera position: (\(String(format: "%.2f", cameraPosition.x)), \(String(format: "%.2f", cameraPosition.y)), \(String(format: "%.2f", cameraPosition.z)))")
             
             // Update depths for proper back-to-front rendering
             let viewMatrix = createViewMatrix()
             GaussianSplatGenerator.updateSplatDepths(splats: &loadedSplats, viewMatrix: viewMatrix)
             
+            // Debug: Manual depth calculation verification
+            print("\n🔧 Manual Depth Calculation Verification:")
+            for i in 0..<min(3, loadedSplats.count) {
+                let splat = loadedSplats[i]
+                let worldPos = SIMD4<Float>(splat.position, 1.0)
+                let viewSpacePos = viewMatrix * worldPos
+                let manualDepth = viewSpacePos.z
+                
+                print("   Splat \(i):")
+                print("     World Pos: (\(String(format: "%.3f", splat.position.x)), \(String(format: "%.3f", splat.position.y)), \(String(format: "%.3f", splat.position.z)))")
+                print("     View Space: (\(String(format: "%.3f", viewSpacePos.x)), \(String(format: "%.3f", viewSpacePos.y)), \(String(format: "%.3f", viewSpacePos.z)), \(String(format: "%.3f", viewSpacePos.w)))")
+                print("     Stored Depth: \(String(format: "%.3f", splat.depth)) | Manual Depth: \(String(format: "%.3f", manualDepth)) \(manualDepth > 0 ? "(behind)" : "(in front)")")
+                print("     Distance from Camera: \(String(format: "%.3f", distance(splat.position, cameraPosition)))")
+            }
+            
             // Update scene
             self.splats = loadedSplats
+            spzDataLoaded = true  // Mark SPZ data as loaded
             setupBuffers()
             
             // Sample some splats for verification
@@ -1827,6 +1943,10 @@ extension TiledSplatRenderer {
             
             print("\n✅ Successfully loaded \(splats.count) splats!")
             print(String(repeating: "=", count: 60) + "\n")
+            
+            // 🔄 CRITICAL FIX: Reset rendering state and force MetalView refresh
+            frameCount = 0  // Reset frame counter for fresh debug output
+            forceRedraw()
             
         } catch SPZParser.SPZError.invalidFile {
             print("\n❌ ERROR: Invalid SPZ file format")

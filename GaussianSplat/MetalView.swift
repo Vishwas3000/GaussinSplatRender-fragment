@@ -18,6 +18,7 @@ struct MetalView: UIViewRepresentable {
         
         let renderer = TiledSplatRenderer(device: device)
         renderer.setMaxSplatCount(20000)
+        renderer.setMetalView(metalView) // Set MetalView reference for forced redraws
         metalView.delegate = renderer
         
         context.coordinator.renderer = renderer
