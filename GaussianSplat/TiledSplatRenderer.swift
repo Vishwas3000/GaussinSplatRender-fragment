@@ -1890,7 +1890,7 @@ extension TiledSplatRenderer {
             }
             
             // 🎯 LIMIT TO FIRST 10,000 SPLATS
-            let maxSplats = 10000
+            let maxSplats = loadedSplats.count
             if loadedSplats.count > maxSplats {
                 loadedSplats = Array(loadedSplats.prefix(maxSplats))
                 print("⚠️ Limited to first \(maxSplats) splats (original: \(parseResult.splats.count))")

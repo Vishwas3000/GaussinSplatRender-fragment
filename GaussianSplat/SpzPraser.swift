@@ -351,7 +351,7 @@ class SPZParser {
             let opacity = Float(alphas[i]) / 255.0
             
             // 🔍 DEBUG: Log first 3 splats for validation (reduced logging)
-            if i < 3 {
+            if i < 100 {
                 print("\n🔍 SPZ Splat \(i) Raw Data:")
                 print("   Position: (\(String(format: "%.4f", x)), \(String(format: "%.4f", y)), \(String(format: "%.4f", z)))")
                 print("   Color: (\(String(format: "%.3f", color.x)), \(String(format: "%.3f", color.y)), \(String(format: "%.3f", color.z)))")
@@ -513,12 +513,12 @@ extension SPZParser.SplatData {
     
     private func computeCovariance(scale: SIMD3<Float>, rotation: simd_quatf) -> simd_float3x3 {
         let rotMatrix = simd_float3x3(rotation)
-        let scaleMatrix = simd_float3x3(
-            SIMD3<Float>(scale.x, 0, 0),
-            SIMD3<Float>(0, scale.y, 0),
-            SIMD3<Float>(0, 0, scale.z)
+        let scaleMatrixSquared = simd_float3x3(
+            SIMD3<Float>(scale.x * scale.x, 0, 0),
+            SIMD3<Float>(0, scale.y * scale.y, 0),
+            SIMD3<Float>(0, 0, scale.z * scale.z)
         )
-        let temp = rotMatrix * scaleMatrix
-        return temp * rotMatrix.transpose
+        // Compute: Σ = R × S² × Rᵀ
+        return rotMatrix * scaleMatrixSquared * rotMatrix.transpose
     }
 }
