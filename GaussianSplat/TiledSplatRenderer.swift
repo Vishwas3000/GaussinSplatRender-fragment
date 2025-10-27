@@ -1889,7 +1889,14 @@ extension TiledSplatRenderer {
                 splatData.toGaussianSplat(index: index)
             }
             
-            print("Converted \(loadedSplats.count) splats")
+            // 🎯 LIMIT TO FIRST 10,000 SPLATS
+            let maxSplats = 10000
+            if loadedSplats.count > maxSplats {
+                loadedSplats = Array(loadedSplats.prefix(maxSplats))
+                print("⚠️ Limited to first \(maxSplats) splats (original: \(parseResult.splats.count))")
+            }
+            
+            print("✅ Using \(loadedSplats.count) splats for rendering")
             
             // Adjust camera to fit scene - position camera to look at the splat cloud
             cameraTarget = center
