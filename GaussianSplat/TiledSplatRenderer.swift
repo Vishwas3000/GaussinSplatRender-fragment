@@ -163,7 +163,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         setupPipelines()
         
         // 🚀 AUTO-LOAD SPZ: Load butterfly.spz directly on startup
-        autoLoadSPZFile()
+        // autoLoadSPZFile()
+        
+        // 🔄 GENERATE CYLINDRICAL SURFACE: Create Gaussian splats on cylinder surface
+        generateCylindricalSurface()
         
         updateCameraPosition() // Initialize camera position
     }
@@ -190,6 +193,175 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         } catch {
             return 0
         }
+    }
+    
+    // MARK: - Cylindrical Surface Generator
+    
+    private func generateCylindricalSurface() {
+        print("🔄 GENERATING CONCENTRIC CYLINDRICAL SURFACES...")
+        
+        let cylinderCenter = SIMD3<Float>(0, 0, 0) // Position at world center
+        let cylinderHeight: Float = 10.0
+        
+        // Define 4 concentric cylinders with different radii and properties
+        let cylinderConfigs = [
+            (radius: 3.0, hueOffset: 0.0, saturation: 0.9, opacity: (0.8, 0.9), thickness: 0.04), // Inner - Red spectrum
+            (radius: 5.0, hueOffset: 0.25, saturation: 0.8, opacity: (0.7, 0.8), thickness: 0.04), // Second - Green spectrum  
+            (radius: 7.0, hueOffset: 0.5, saturation: 0.7, opacity: (0.6, 0.7), thickness: 0.04), // Third - Blue spectrum
+            (radius: 9.0, hueOffset: 0.75, saturation: 0.6, opacity: (0.5, 0.6), thickness: 0.04)  // Outer - Purple spectrum
+        ]
+        
+        // Surface resolution parameters (reduced to ensure all cylinders fit in LOD)
+        let circumferentialSamples = 60   // Around each cylinder
+        let heightSamples = 80           // Along cylinder height (increased for uniform height)
+        
+        let totalSplatsPerCylinder = circumferentialSamples * heightSamples
+        let totalSplats = totalSplatsPerCylinder * cylinderConfigs.count
+        
+        print("   Concentric Cylinder System:")
+        print("     Number of cylinders: \(cylinderConfigs.count)")
+        print("     Height: \(cylinderHeight)")
+        print("     Center: (\(cylinderCenter.x), \(cylinderCenter.y), \(cylinderCenter.z))")
+        print("     Radii: \(cylinderConfigs.map { $0.radius })")
+        print("     Resolution per cylinder: \(circumferentialSamples) x \(heightSamples) = \(totalSplatsPerCylinder)")
+        print("     Total splats: \(totalSplats)")
+        
+        var cylindricalSplats: [GaussianSplat] = []
+        
+        // Generate splats for each concentric cylinder
+        for (cylinderIdx, config) in cylinderConfigs.enumerated() {
+            print("   Generating cylinder \(cylinderIdx + 1)/\(cylinderConfigs.count) (radius: \(config.radius), height: \(cylinderHeight))...")
+            
+            for heightIdx in 0..<heightSamples {
+                for circumIdx in 0..<circumferentialSamples {
+                    
+                    // Parametric coordinates
+                    let u = Float(circumIdx) / Float(circumferentialSamples) // [0, 1) around circumference
+                    let v = Float(heightIdx) / Float(heightSamples - 1)      // [0, 1] along height
+                    
+                    // Cylindrical coordinates to Cartesian
+                    let theta = u * 2.0 * Float.pi  // Angle around cylinder
+                    let y = (v - 0.5) * cylinderHeight  // Center height at origin: -5 to +5
+                    
+                    let x = Float(config.radius) * cos(theta)
+                    let z = Float(config.radius) * sin(theta)
+                    
+                    // World position
+                    let localPosition = SIMD3<Float>(x, y, z)
+                    let worldPosition = cylinderCenter + localPosition
+                    
+                    // Surface normal (pointing outward from cylinder axis)
+                    let surfaceNormal = normalize(SIMD3<Float>(x, 0, z))
+                    
+                    // Create oriented 3D covariance aligned with cylinder surface
+                    let tangentU = SIMD3<Float>(-sin(theta), 0, cos(theta))  // Circumferential
+                    let tangentV = SIMD3<Float>(0, 1, 0)                     // Height direction
+                    let normal = surfaceNormal
+                    
+                    // Scale covariance based on cylinder radius and config
+                    let scaleU: Float = 0.1 + (Float(config.radius) * 0.02)  // Larger cylinders have slightly larger splats
+                    let scaleV: Float = 0.08 + (Float(config.radius) * 0.015) // Height spread
+                    let scaleN: Float = Float(config.thickness)                // Normal (thickness) spread
+                    
+                    let covMatrix3x3 = createSurfaceAlignedCovariance(
+                        tangentU: tangentU, scaleU: scaleU,
+                        tangentV: tangentV, scaleV: scaleV,
+                        normal: normal, scaleN: scaleN
+                    )
+                    
+                    // Color scheme: Each cylinder has different hue offset + height variation
+                    let heightColor = v  // 0 (bottom) to 1 (top)
+                    let angleColor = u   // 0 to 1 around circumference
+                    
+                    // Apply hue offset for each cylinder + circumferential variation + height variation
+                    let circumHue = Float(config.hueOffset) + (angleColor * 0.2)
+                    let heightHue = heightColor * 0.3  // Height adds 30% spectrum shift
+                    let baseHue = circumHue + heightHue
+                    let hue = fmod(baseHue, 1.0)  // Wrap around [0, 1]
+                    
+                    let saturation = Float(config.saturation) * (0.7 + 0.3 * heightColor)  // Higher saturation at top
+                    let brightness = 0.2 + 0.8 * heightColor  // Much more dramatic height gradient
+                    
+                    let color = hsb_to_rgb(hue: hue, saturation: saturation, brightness: brightness)
+                    
+                    // Opacity variation based on cylinder config
+                    let opacity = Float.random(in: Float(config.opacity.0)...Float(config.opacity.1))
+                    
+                    // Calculate depth for sorting
+                    let viewMatrix = createViewMatrix()
+                    let viewSpacePos = viewMatrix * SIMD4<Float>(worldPosition, 1.0)
+                    let depth = viewSpacePos.z
+                    
+                    let splat = GaussianSplat(
+                        position: worldPosition,
+                        covariance3D: covMatrix3x3,
+                        color: color,
+                        opacity: opacity,
+                        depth: depth
+                    )
+                    
+                    cylindricalSplats.append(splat)
+                }
+            }
+        }
+        
+        // Temporarily increase max splat count for cylinder demonstration
+        let originalMaxCount = maxSplatCount
+        maxSplatCount = max(maxSplatCount, cylindricalSplats.count)
+        
+        self.splats = cylindricalSplats
+        
+        print("   ⚠️  Increased maxSplatCount from \(originalMaxCount) to \(maxSplatCount) for cylinder demo")
+        print("   🚀 Tile building optimized: Removed redundant O(n²) insertion sort")
+        
+        print("✅ Generated \(splats.count) concentric cylindrical surface splats")
+        print("   Splats per cylinder: \(totalSplatsPerCylinder)")
+        let totalSurfaceArea = cylinderConfigs.reduce(Float(0)) { result, config in
+            return result + (2.0 * Float.pi * Float(config.radius) * cylinderHeight)
+        }
+        print("   Total surface area: \(String(format: "%.1f", totalSurfaceArea)) units²")
+        
+        // Debug: Print sample splats from each cylinder
+        print("\n🔍 Concentric Cylinder Splat Samples:")
+        for (idx, config) in cylinderConfigs.enumerated() {
+            let splatIdx = idx * totalSplatsPerCylinder
+            if splatIdx < splats.count {
+                let splat = splats[splatIdx]
+                print("   Cylinder \(idx + 1) (radius \(config.radius)):")
+                print("     Position: (\(String(format: "%.3f", splat.position.x)), \(String(format: "%.3f", splat.position.y)), \(String(format: "%.3f", splat.position.z)))")
+                print("     Color: (\(String(format: "%.3f", splat.floatColor.x)), \(String(format: "%.3f", splat.floatColor.y)), \(String(format: "%.3f", splat.floatColor.z)))")
+                print("     Opacity: \(String(format: "%.3f", splat.floatOpacity))")
+            }
+        }
+        
+        spzDataLoaded = true  // Mark as custom data loaded
+        setupBuffers()
+        forceRedraw()
+    }
+    
+    private func createSurfaceAlignedCovariance(
+        tangentU: SIMD3<Float>, scaleU: Float,
+        tangentV: SIMD3<Float>, scaleV: Float,
+        normal: SIMD3<Float>, scaleN: Float
+    ) -> simd_float3x3 {
+        
+        // Build rotation matrix from surface frame
+        let u = normalize(tangentU)
+        let v = normalize(tangentV)
+        let n = normalize(normal)
+        
+        // Rotation matrix: [u v n] (column vectors)
+        let R = simd_float3x3(u, v, n)
+        
+        // Scale matrix (ellipsoid radii)
+        let S = simd_float3x3(
+            SIMD3<Float>(scaleU * scaleU, 0, 0),
+            SIMD3<Float>(0, scaleV * scaleV, 0),
+            SIMD3<Float>(0, 0, scaleN * scaleN)
+        )
+        
+        // Covariance matrix: C = R * S * R^T
+        return R * S * R.transpose
     }
     
     private func setupPipelines() {
@@ -1692,7 +1864,7 @@ private func renderWithOptimizedPipeline(commandBuffer: MTLCommandBuffer) {
         //     }
         //     blitEncoder.endEncoding()
         // }
-        print("🚫 IDENTITY MAPPING DISABLED - No index buffer manipulation")
+//        print("🚫 IDENTITY MAPPING DISABLED - No index buffer manipulation")
         
         // Debug: Morton codes and sorting completely disabled
         if frameCount % 60 == 0 && sortCount > 0 {
@@ -1890,7 +2062,7 @@ extension TiledSplatRenderer {
             }
             
             // 🎯 LIMIT TO FIRST 10,000 SPLATS
-            let maxSplats = loadedSplats.count
+            let maxSplats = 40000
             if loadedSplats.count > maxSplats {
                 loadedSplats = Array(loadedSplats.prefix(maxSplats))
                 print("⚠️ Limited to first \(maxSplats) splats (original: \(parseResult.splats.count))")

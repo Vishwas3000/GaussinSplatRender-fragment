@@ -548,8 +548,8 @@ kernel void buildTilesOptimized(
         }
     }
 
-    // Splats are now depth-sorted in FRONT-TO-BACK order (nearest first)
-    // This matches the official 3D Gaussian Splatting rendering method
+    // Splats are collected (unsorted) - sorting handled by dedicated sortTileDepth pass
+    // This optimizes performance by eliminating redundant O(n²) insertion sort
 
     // Write final tile statistics
     tiles[tileIndex].count = count;
@@ -677,31 +677,11 @@ kernel void buildTilesWithVisibleList(
         bool overlaps = dist2 <= radius2;
 
         if (overlaps) {
-            // === DEPTH-SORTED INSERTION (FRONT-TO-BACK - Official 3DGS) ===
-            // CRITICAL: Must sort FRONT-TO-BACK (nearest first) per official 3DGS
+            // === OPTIMIZED: SIMPLE APPEND (NO REDUNDANT SORTING) ===
+            // Depth sorting is handled by dedicated sortTileDepth pass later
             if (count < tileUniforms.maxSplatsPerTile) {
-                // Find insertion position (front-to-back order)
-                uint insertPos = count;
-                for (uint j = 0; j < count; j++) {
-                    uint otherIdx = tiles[tileIndex].splatIndices[j];
-                    float4 otherViewPos = viewUniforms.viewMatrix * float4(splats[otherIdx].position, 1.0);
-                    float otherZ = -otherViewPos.z;
-
-                    // Insert before if current splat is CLOSER (front-to-back order)
-                    // Add small epsilon to prevent depth fighting with co-planar splats
-                    if (z < otherZ - 0.0001) {
-                        insertPos = j;
-                        break;
-                    }
-                }
-
-                // Shift elements
-                for (uint j = count; j > insertPos; j--) {
-                    tiles[tileIndex].splatIndices[j] = tiles[tileIndex].splatIndices[j - 1];
-                }
-
-                // Insert (store ORIGINAL splat index, not visible index!)
-                tiles[tileIndex].splatIndices[insertPos] = i;
+                // Simple append - much faster than insertion sort
+                tiles[tileIndex].splatIndices[count] = i;
                 count++;
             }
             workload += uint(radiusPixels);
@@ -710,8 +690,8 @@ kernel void buildTilesWithVisibleList(
         }
     }
 
-    // Splats are now depth-sorted in FRONT-TO-BACK order (nearest first)
-    // This matches the official 3D Gaussian Splatting rendering method
+    // Splats are collected (unsorted) - sorting handled by dedicated sortTileDepth pass
+    // This optimizes performance by eliminating redundant O(n²) insertion sort
 
     // Write final tile statistics
     tiles[tileIndex].count = count;

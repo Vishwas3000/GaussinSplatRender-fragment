@@ -417,24 +417,9 @@ kernel void buildTiles(
         }
     }
 
-    // === CRITICAL: Sort splat indices by depth (FRONT-TO-BACK - Official 3DGS) ===
-    // For proper alpha blending, we MUST render splats in FRONT-TO-BACK order
-    // This means: NEAREST splat FIRST (smallest |depth|), FARTHEST splat LAST
-    // Simple insertion sort (efficient for small arrays like 64 elements)
-    for (uint i = 1; i < count; i++) {
-        uint keyIndex = tiles[tileIndex].splatIndices[i];
-        float keyDepth = splats[keyIndex].depth;
-        int j = int(i) - 1;
-
-        // Move elements forward while they're FARTHER than key (for front-to-back order)
-        // CRITICAL: depth is NEGATIVE (-z), so farther = more negative
-        // For front-to-back: want [-2, -5, -10] (descending), so use <
-        while (j >= 0 && splats[tiles[tileIndex].splatIndices[j]].depth < keyDepth) {
-            tiles[tileIndex].splatIndices[j + 1] = tiles[tileIndex].splatIndices[j];
-            j--;
-        }
-        tiles[tileIndex].splatIndices[j + 1] = keyIndex;
-    }
+    // === OPTIMIZED: NO REDUNDANT SORTING ===
+    // Depth sorting is handled by dedicated sortTileDepth pass later
+    // This eliminates redundant O(n²) insertion sort during tile building
 
     // Write final tile statistics
     tiles[tileIndex].count = count;
