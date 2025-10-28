@@ -170,7 +170,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     
     private func autoLoadSPZFile() {
         // Load butterfly.spz directly from app bundle
-        guard let bundlePath = Bundle.main.url(forResource: "butterfly", withExtension: "spz") else {
+        guard let bundlePath = Bundle.main.url(forResource: "furry", withExtension: "spz") else {
             print("❌ AUTO-LOAD: butterfly.spz not found in app bundle!")
             print("   Make sure butterfly.spz is added to the Xcode project and included in the bundle")
             generateRandomScene()

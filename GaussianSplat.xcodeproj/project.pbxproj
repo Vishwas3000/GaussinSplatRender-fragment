@@ -29,9 +29,30 @@
 		6EBB296B2E8C5F6200AD1411 /* GaussianSplatUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GaussianSplatUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		A44DFD902EAF8BA9005DE74C /* Exceptions for "GaussianSplat" folder in "GaussianSplatTests" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				furry.spz,
+			);
+			target = 6EBB29602E8C5F6200AD1411 /* GaussianSplatTests */;
+		};
+		A44DFD912EAF8BA9005DE74C /* Exceptions for "GaussianSplat" folder in "GaussianSplatUITests" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				furry.spz,
+			);
+			target = 6EBB296A2E8C5F6200AD1411 /* GaussianSplatUITests */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		6EBB29532E8C5F6000AD1411 /* GaussianSplat */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				A44DFD902EAF8BA9005DE74C /* Exceptions for "GaussianSplat" folder in "GaussianSplatTests" target */,
+				A44DFD912EAF8BA9005DE74C /* Exceptions for "GaussianSplat" folder in "GaussianSplatUITests" target */,
+			);
 			path = GaussianSplat;
 			sourceTree = "<group>";
 		};
