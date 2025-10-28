@@ -172,7 +172,7 @@ struct TileUniforms {
 
 extension GaussianSplat: Comparable {
     static func < (lhs: GaussianSplat, rhs: GaussianSplat) -> Bool {
-        return lhs.depth > rhs.depth // Sort back-to-front for alpha blending
+        return lhs.depth < rhs.depth // Sort front-to-back for GPU alpha blending (smaller depth = closer)
     }
 }
 

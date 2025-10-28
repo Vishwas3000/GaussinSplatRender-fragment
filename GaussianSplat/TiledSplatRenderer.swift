@@ -94,6 +94,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var cameraDistance: Float = 8.0                          // Distance from target
     private var cameraAzimuth: Float = 0.0                          // Horizontal rotation around target
     private var cameraElevation: Float = 0.0                        // Vertical angle (up/down)
+    
+    // Previous camera state for optimized sorting detection
+    private var previousCameraAzimuth: Float = 0.0
+    private var previousCameraElevation: Float = 0.0
     private var cameraPosition: SIMD3<Float> = SIMD3<Float>(0, 0, 8) // Computed position
     
     // Gesture control state
@@ -198,22 +202,21 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     // MARK: - Cylindrical Surface Generator
     
     private func generateCylindricalSurface() {
+        let viewMatrix = createViewMatrix() // Compute once for all splats
         print("🔄 GENERATING CONCENTRIC CYLINDRICAL SURFACES...")
         
         let cylinderCenter = SIMD3<Float>(0, 0, 0) // Position at world center
         let cylinderHeight: Float = 10.0
         
-        // Define 4 concentric cylinders with different radii and properties
+        // Define 2 concentric cylinders for testing (REDUCED for debugging)
         let cylinderConfigs = [
-            (radius: 3.0, hueOffset: 0.0, saturation: 0.9, opacity: (0.8, 0.9), thickness: 0.04), // Inner - Red spectrum
-            (radius: 5.0, hueOffset: 0.25, saturation: 0.8, opacity: (0.7, 0.8), thickness: 0.04), // Second - Green spectrum  
-            (radius: 7.0, hueOffset: 0.5, saturation: 0.7, opacity: (0.6, 0.7), thickness: 0.04), // Third - Blue spectrum
-            (radius: 9.0, hueOffset: 0.75, saturation: 0.6, opacity: (0.5, 0.6), thickness: 0.04)  // Outer - Purple spectrum
+            (radius: 4.0, hueOffset: 0.0, saturation: 0.9, opacity: (0.7, 0.8), thickness: 0.08), // Inner - Red spectrum
+            (radius: 7.0, hueOffset: 0.5, saturation: 0.7, opacity: (0.5, 0.6), thickness: 0.08), // Outer - Blue spectrum
         ]
         
-        // Surface resolution parameters (reduced to ensure all cylinders fit in LOD)
-        let circumferentialSamples = 60   // Around each cylinder
-        let heightSamples = 80           // Along cylinder height (increased for uniform height)
+        // Surface resolution parameters (REDUCED for testing smooth surfaces)
+        let circumferentialSamples = 30   // Around each cylinder (reduced)
+        let heightSamples = 40           // Along cylinder height (reduced)
         
         let totalSplatsPerCylinder = circumferentialSamples * heightSamples
         let totalSplats = totalSplatsPerCylinder * cylinderConfigs.count
@@ -258,10 +261,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
                     let tangentV = SIMD3<Float>(0, 1, 0)                     // Height direction
                     let normal = surfaceNormal
                     
-                    // Scale covariance based on cylinder radius and config
-                    let scaleU: Float = 0.1 + (Float(config.radius) * 0.02)  // Larger cylinders have slightly larger splats
-                    let scaleV: Float = 0.08 + (Float(config.radius) * 0.015) // Height spread
-                    let scaleN: Float = Float(config.thickness)                // Normal (thickness) spread
+                    // Scale covariance based on cylinder radius and config (INCREASED for smoother surface)
+                    let scaleU: Float = 0.3 + (Float(config.radius) * 0.05)  // Circumferential spread (increased)
+                    let scaleV: Float = 0.25 + (Float(config.radius) * 0.03) // Height spread (increased)
+                    let scaleN: Float = Float(config.thickness) * 3.0         // Normal thickness (3x increased)
                     
                     let covMatrix3x3 = createSurfaceAlignedCovariance(
                         tangentU: tangentU, scaleU: scaleU,
@@ -287,10 +290,9 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
                     // Opacity variation based on cylinder config
                     let opacity = Float.random(in: Float(config.opacity.0)...Float(config.opacity.1))
                     
-                    // Calculate depth for sorting
-                    let viewMatrix = createViewMatrix()
+                    // Calculate depth for sorting (CORRECTED: negate Z for front-to-back ordering)
                     let viewSpacePos = viewMatrix * SIMD4<Float>(worldPosition, 1.0)
-                    let depth = viewSpacePos.z
+                    let depth = -viewSpacePos.z  // Negate Z: smaller depth = closer to camera
                     
                     let splat = GaussianSplat(
                         position: worldPosition,
@@ -309,30 +311,10 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let originalMaxCount = maxSplatCount
         maxSplatCount = max(maxSplatCount, cylindricalSplats.count)
         
+        // CRITICAL: Sort splats by depth for proper alpha blending
+        // GPU tile building assumes splats are pre-sorted front-to-back
+        cylindricalSplats.sort()
         self.splats = cylindricalSplats
-        
-        print("   ⚠️  Increased maxSplatCount from \(originalMaxCount) to \(maxSplatCount) for cylinder demo")
-        print("   🚀 Tile building optimized: Removed redundant O(n²) insertion sort")
-        
-        print("✅ Generated \(splats.count) concentric cylindrical surface splats")
-        print("   Splats per cylinder: \(totalSplatsPerCylinder)")
-        let totalSurfaceArea = cylinderConfigs.reduce(Float(0)) { result, config in
-            return result + (2.0 * Float.pi * Float(config.radius) * cylinderHeight)
-        }
-        print("   Total surface area: \(String(format: "%.1f", totalSurfaceArea)) units²")
-        
-        // Debug: Print sample splats from each cylinder
-        print("\n🔍 Concentric Cylinder Splat Samples:")
-        for (idx, config) in cylinderConfigs.enumerated() {
-            let splatIdx = idx * totalSplatsPerCylinder
-            if splatIdx < splats.count {
-                let splat = splats[splatIdx]
-                print("   Cylinder \(idx + 1) (radius \(config.radius)):")
-                print("     Position: (\(String(format: "%.3f", splat.position.x)), \(String(format: "%.3f", splat.position.y)), \(String(format: "%.3f", splat.position.z)))")
-                print("     Color: (\(String(format: "%.3f", splat.floatColor.x)), \(String(format: "%.3f", splat.floatColor.y)), \(String(format: "%.3f", splat.floatColor.z)))")
-                print("     Opacity: \(String(format: "%.3f", splat.floatOpacity))")
-            }
-        }
         
         spzDataLoaded = true  // Mark as custom data loaded
         setupBuffers()
@@ -775,9 +757,9 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             
             let finalPosition = position + noise
             
-            // Calculate depth
+            // Calculate depth (CORRECTED: negate Z for front-to-back ordering)
             let viewSpacePos = viewMatrix * SIMD4<Float>(finalPosition, 1.0)
-            let depth = viewSpacePos.z
+            let depth = -viewSpacePos.z  // Negate Z: smaller depth = closer to camera
             
             // Create varied 3D covariance with more dramatic scale differences
             let scale = Float.random(in: 0.2...1.5) // Much wider range
@@ -952,7 +934,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         }
     }
     
-    private func updateCamera(time: Float) {
+    private func updateCamera(time: Float, viewMatrix: simd_float4x4) {
         let previousPosition = cameraPosition
         
         // Calculate camera position from spherical coordinates around target
@@ -963,9 +945,30 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             updateCameraTrail()
         }
         
-        // Update splat depths for proper sorting
-        let viewMatrix = createViewMatrix()
+        // Update splat depths for proper sorting (using pre-computed view matrix)
+        // OPTIMIZATION: Reusing view matrix computed in draw() - eliminates redundant matrix calculation
         GaussianSplatGenerator.updateSplatDepths(splats: &splats, viewMatrix: viewMatrix)
+        
+        // CRITICAL FIX: Re-sort splats when camera view changes significantly
+        // Detect both position and rotation changes for optimal sorting
+        let positionChanged = distance(previousPosition, cameraPosition) > 0.1
+        let azimuthChanged = abs(cameraAzimuth - previousCameraAzimuth) > 0.1    // ~5.7 degrees
+        let elevationChanged = abs(cameraElevation - previousCameraElevation) > 0.1
+        
+        if positionChanged || azimuthChanged || elevationChanged {
+            let beforeDepths = splats.prefix(3).map { $0.depth }
+            splats.sort()
+            let afterDepths = splats.prefix(3).map { $0.depth }
+            
+            // Debug: Track sorting events and verify depth ordering
+            print("🔄 Re-sorted \(splats.count) splats - Pos: \(positionChanged), Az: \(azimuthChanged), El: \(elevationChanged)")
+            print("   Before sort: depths [\(beforeDepths.map { String(format: "%.2f", $0) }.joined(separator: ", "))]")
+            print("   After sort:  depths [\(afterDepths.map { String(format: "%.2f", $0) }.joined(separator: ", "))] (front→back)")
+            
+            // Update previous camera state for next frame
+            previousCameraAzimuth = cameraAzimuth
+            previousCameraElevation = cameraElevation
+        }
         
         // Update splat buffer with new depth values
         let splatPtr = splatBuffer.contents().bindMemory(to: GaussianSplat.self, capacity: splats.count)
@@ -1227,15 +1230,14 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         }
         
         let time = Float(CACurrentMediaTime())
-        updateCamera(time: time)
-        
         let drawableSize = view.drawableSize
         let aspect = Float(drawableSize.width / drawableSize.height)
         
-        // Update view uniforms
+        // OPTIMIZATION: Compute matrices once and pass to updateCamera  
         let viewMatrix = createViewMatrix()
         let projectionMatrix = createProjectionMatrix(aspect: aspect)
         let viewProjectionMatrix = projectionMatrix * viewMatrix
+        updateCamera(time: time, viewMatrix: viewMatrix)
 
         let viewUniforms = ViewUniforms(
             viewMatrix: viewMatrix,

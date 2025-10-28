@@ -22,9 +22,9 @@ class GaussianSplatGenerator {
                 Float.random(in: 0...1) * boxSize.z + boundingBox.min.z
             )
             
-            // Calculate depth for sorting
+            // Calculate depth for sorting (CORRECTED: negate Z for front-to-back ordering)
             let viewSpacePos = viewMatrix * SIMD4<Float>(position, 1.0)
-            let depth = viewSpacePos.z
+            let depth = -viewSpacePos.z  // Negate Z: smaller depth = closer to camera
             
             // Random 3D covariance matrix with dramatic variety
             let scale = Float.random(in: 0.1...2.0) * scaleMultiplier // Apply scale multiplier
@@ -92,9 +92,9 @@ class GaussianSplatGenerator {
                 
                 let position = clusterCenter + offset
                 
-                // Calculate depth
+                // Calculate depth (CORRECTED: negate Z for front-to-back ordering)
                 let viewSpacePos = viewMatrix * SIMD4<Float>(position, 1.0)
-                let depth = viewSpacePos.z
+                let depth = -viewSpacePos.z  // Negate Z: smaller depth = closer to camera
                 
                 // 3D Covariance with dramatic variety based on distance from cluster center
                 let distanceFromCenter = length(offset)
@@ -152,9 +152,9 @@ class GaussianSplatGenerator {
                 r * cos(phi)
             )
             
-            // Calculate depth
+            // Calculate depth (CORRECTED: negate Z for front-to-back ordering)
             let viewSpacePos = viewMatrix * SIMD4<Float>(position, 1.0)
-            let depth = viewSpacePos.z
+            let depth = -viewSpacePos.z  // Negate Z: smaller depth = closer to camera
             
             // 3D Covariance based on position on sphere
             let scale = (0.5 + (r / radius - 0.7) * 1.0) * scaleMultiplier  // Apply scale multiplier
@@ -221,7 +221,7 @@ extension GaussianSplatGenerator {
                 covariance3D: splats[i].covariance3DMatrix,
                 color: splats[i].floatColor,
                 opacity: splats[i].floatOpacity,
-                depth: viewSpacePos.z
+                depth: -viewSpacePos.z  // Negate Z: smaller depth = closer to camera
             )
         }
     }
