@@ -50,8 +50,8 @@ class GaussianSplatGenerator {
             splats.append(splat)
         }
         
-        // Sort back-to-front for proper alpha blending
-        splats.sort()
+        // REMOVED: Sorting now handled by performOptimizedDepthCalculationAndSort()
+        // splats.sort()
         
         return splats
     }
@@ -122,8 +122,8 @@ class GaussianSplatGenerator {
             }
         }
         
-        // Sort for alpha blending
-        splats.sort()
+        // REMOVED: Sorting now handled by performOptimizedDepthCalculationAndSort()
+        // splats.sort()
         
         return splats
     }
@@ -180,7 +180,8 @@ class GaussianSplatGenerator {
             splats.append(splat)
         }
         
-        splats.sort()
+        // REMOVED: Sorting now handled by performOptimizedDepthCalculationAndSort()
+        // splats.sort()
         return splats
     }
 }

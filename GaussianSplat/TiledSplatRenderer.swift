@@ -83,7 +83,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var useGPUFrustumCulling: Bool = true   // ENABLED: Using deterministic frustum culling
     
     // Simple CPU Sorting (Energy Efficient)
-    private var useHybridSorting: Bool = false  // Enable simple CPU distance sorting
+    private var useHybridSorting: Bool = true   // ENABLED: Use simple CPU distance sorting (eliminates GPU sorting overhead)
 
     // Splat data
     var splats: [GaussianSplat] = []
@@ -98,6 +98,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     // Previous camera state for optimized sorting detection
     private var previousCameraAzimuth: Float = 0.0
     private var previousCameraElevation: Float = 0.0
+    private var needsSorting: Bool = true  // Flag to trigger sorting when camera moves
     private var cameraPosition: SIMD3<Float> = SIMD3<Float>(0, 0, 8) // Computed position
     
     // Gesture control state
@@ -108,7 +109,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private var cameraDebugMode: CameraDebugMode = .off
     
     // Scene generation parameters
-    private var maxSplatCount: Int = 5000  // Configurable max splat count
+    private var maxSplatCount: Int = 10000  // Configurable max splat count
     private var splatScaleMultiplier: Float = 0.3  // Reduce covariance scale
     
     // Energy monitoring and adaptive quality
@@ -167,17 +168,17 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         setupPipelines()
         
         // 🚀 AUTO-LOAD SPZ: Load butterfly.spz directly on startup
-        // autoLoadSPZFile()
+//        autoLoadSPZFile()
         
         // 🔄 GENERATE CYLINDRICAL SURFACE: Create Gaussian splats on cylinder surface
-        generateCylindricalSurface()
+         generateCylindricalSurface()
         
         updateCameraPosition() // Initialize camera position
     }
     
     private func autoLoadSPZFile() {
         // Load butterfly.spz directly from app bundle
-        guard let bundlePath = Bundle.main.url(forResource: "furry", withExtension: "spz") else {
+        guard let bundlePath = Bundle.main.url(forResource: "butterfly", withExtension: "spz") else {
             print("❌ AUTO-LOAD: butterfly.spz not found in app bundle!")
             print("   Make sure butterfly.spz is added to the Xcode project and included in the bundle")
             generateRandomScene()
@@ -206,16 +207,21 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         print("🔄 GENERATING CONCENTRIC CYLINDRICAL SURFACES...")
         
         let cylinderCenter = SIMD3<Float>(0, 0, 0) // Position at world center
-        let cylinderHeight: Float = 10.0
+        let cylinderHeight: Float = 20.0
         
         // Define 2 concentric cylinders for testing (REDUCED for debugging)
         let cylinderConfigs = [
             (radius: 4.0, hueOffset: 0.0, saturation: 0.9, opacity: (0.7, 0.8), thickness: 0.08), // Inner - Red spectrum
-            (radius: 7.0, hueOffset: 0.5, saturation: 0.7, opacity: (0.5, 0.6), thickness: 0.08), // Outer - Blue spectrum
+            (radius: 4.5, hueOffset: 0.2, saturation: 0.7, opacity: (0.5, 0.6), thickness: 0.08), // Outer - Blue spectrum
+            (radius: 5.0, hueOffset: 0.5, saturation: 0.8, opacity: (0.5, 0.9), thickness: 0.09), // Outer - Blue spectrum
+            (radius: 10.0, hueOffset: 0.7, saturation: 0.6, opacity: (0.3, 0.4), thickness: 0.1), // Outer - Blue spectrum
+            (radius: 12.0, hueOffset: 0.7, saturation: 0.6, opacity: (0.3, 0.4), thickness: 0.1), // Outer - Blue spectrum
+            (radius: 15.0, hueOffset: 0.7, saturation: 0.6, opacity: (0.3, 0.4), thickness: 0.1), // Outer - Blue spectrum
+            (radius: 17.0, hueOffset: 0.7, saturation: 0.6, opacity: (0.3, 0.4), thickness: 0.1) // Outer - Blue spectrum
         ]
         
         // Surface resolution parameters (REDUCED for testing smooth surfaces)
-        let circumferentialSamples = 30   // Around each cylinder (reduced)
+        let circumferentialSamples = 40   // Around each cylinder (reduced)
         let heightSamples = 40           // Along cylinder height (reduced)
         
         let totalSplatsPerCylinder = circumferentialSamples * heightSamples
@@ -311,9 +317,8 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let originalMaxCount = maxSplatCount
         maxSplatCount = max(maxSplatCount, cylindricalSplats.count)
         
-        // CRITICAL: Sort splats by depth for proper alpha blending
-        // GPU tile building assumes splats are pre-sorted front-to-back
-        cylindricalSplats.sort()
+        // REMOVED: Sorting now handled by performOptimizedDepthCalculationAndSort()
+        // cylindricalSplats.sort()
         self.splats = cylindricalSplats
         
         spzDataLoaded = true  // Mark as custom data loaded
@@ -934,7 +939,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         }
     }
     
-    private func updateCamera(time: Float, viewMatrix: simd_float4x4) {
+    private func updateCamera(time: Float) {
         let previousPosition = cameraPosition
         
         // Calculate camera position from spherical coordinates around target
@@ -945,9 +950,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             updateCameraTrail()
         }
         
-        // Update splat depths for proper sorting (using pre-computed view matrix)
-        // OPTIMIZATION: Reusing view matrix computed in draw() - eliminates redundant matrix calculation
-        GaussianSplatGenerator.updateSplatDepths(splats: &splats, viewMatrix: viewMatrix)
+        // Note: Depth calculation now happens AFTER culling to only process visible splats
         
         // CRITICAL FIX: Re-sort splats when camera view changes significantly
         // Detect both position and rotation changes for optimal sorting
@@ -955,25 +958,14 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let azimuthChanged = abs(cameraAzimuth - previousCameraAzimuth) > 0.1    // ~5.7 degrees
         let elevationChanged = abs(cameraElevation - previousCameraElevation) > 0.1
         
+        // Camera movement detection for sorting optimization
         if positionChanged || azimuthChanged || elevationChanged {
-            let beforeDepths = splats.prefix(3).map { $0.depth }
-            splats.sort()
-            let afterDepths = splats.prefix(3).map { $0.depth }
-            
-            // Debug: Track sorting events and verify depth ordering
-            print("🔄 Re-sorted \(splats.count) splats - Pos: \(positionChanged), Az: \(azimuthChanged), El: \(elevationChanged)")
-            print("   Before sort: depths [\(beforeDepths.map { String(format: "%.2f", $0) }.joined(separator: ", "))]")
-            print("   After sort:  depths [\(afterDepths.map { String(format: "%.2f", $0) }.joined(separator: ", "))] (front→back)")
+            needsSorting = true  // Flag that sorting is needed in next render cycle
+            print("🔄 Camera moved - sorting flagged for next render cycle")
             
             // Update previous camera state for next frame
             previousCameraAzimuth = cameraAzimuth
             previousCameraElevation = cameraElevation
-        }
-        
-        // Update splat buffer with new depth values
-        let splatPtr = splatBuffer.contents().bindMemory(to: GaussianSplat.self, capacity: splats.count)
-        for i in 0..<splats.count {
-            splatPtr[i] = splats[i]
         }
     }
     
@@ -1192,27 +1184,105 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     }
     
     
-    /// Simple CPU sort ALL splats by distance - replaces GPU radix sort
-    private func performCPUSort() {
+    /// Perform frustum culling to identify visible splats first
+    private func performFrustumCulling(commandBuffer: MTLCommandBuffer) {
+        // Use existing deterministic frustum culling
+        let visibleCount = performDeterministicFrustumCulling(commandBuffer: commandBuffer, splatCount: splats.count)
+        print("🔍 Frustum Culling: \(visibleCount)/\(splats.count) splats visible")
+    }
+    
+    /// Calculate depths and sort ONLY for visible splats
+    private func performOptimizedDepthCalculationAndSort() {
+        guard needsSorting else { return }
+        
         let startTime = CACurrentMediaTime()
         
-        // Sort ALL splats by distance from camera (front-to-back)
-        let indexedDistances = splats.enumerated().map { (index, splat) -> (Int, Float) in
-            let delta = splat.position - cameraPosition
-            let distanceSquared = dot(delta, delta)
-            return (index, distanceSquared)
+        let visibleCountPtr = visibleSplatCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
+        let visibleCount = Int(visibleCountPtr[0])
+        
+        guard visibleCount > 0 else {
+            print("⚠️ No visible splats after culling")
+            return
         }
         
-        let sorted = indexedDistances.sorted { $0.1 < $1.1 }
+        let visibleIndicesPtr = visibleSplatIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: visibleCount)
+        let viewMatrix = createViewMatrix()
+        
+        var visibleSplatsWithDepth: [(index: Int, depth: Float)] = []
+        visibleSplatsWithDepth.reserveCapacity(visibleCount)
+        
+        for i in 0..<visibleCount {
+            let splatIndex = Int(visibleIndicesPtr[i])
+            let splat = splats[splatIndex]
+            
+            // Transform to view space using your view matrix
+            let viewSpacePos = viewMatrix * SIMD4<Float>(splat.position, 1.0)
+            
+            // ✅ FIXED: Use -viewSpacePos.z for consistency with GPU shader
+            // Positive depth = closer to camera, negative depth = further from camera
+            let depth = -viewSpacePos.z
+            
+            splats[splatIndex] = GaussianSplat(
+                position: splat.position,
+                covariance3D: splat.covariance3DMatrix,
+                color: splat.floatColor,
+                opacity: splat.floatOpacity,
+                depth: depth
+            )
+            
+            visibleSplatsWithDepth.append((index: splatIndex, depth: depth))
+        }
+        
+        // ✅ Sort front-to-back: smaller depth (closer) first
+        let sortedVisible = visibleSplatsWithDepth.sorted { $0.depth < $1.depth }
+        let sortedIndices = sortedVisible.map { UInt32($0.index) }
+        
+        let bufferPointer = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: visibleCount)
+        for (index, splatIndex) in sortedIndices.enumerated() {
+            bufferPointer[index] = splatIndex
+        }
+        
+        needsSorting = false
+        let processingTime = CACurrentMediaTime() - startTime
+        
+        print("🔄 Optimized Pipeline: Processed \(visibleCount) visible splats in \(String(format: "%.2f", processingTime * 1000))ms")
+        if let minDepth = sortedVisible.first?.depth, let maxDepth = sortedVisible.last?.depth {
+            print("   Depth range: \(String(format: "%.2f", minDepth)) (front) → \(String(format: "%.2f", maxDepth)) (back)")
+        }
+    }
+    /// Legacy function - kept for compatibility
+    private func performCPUSort() {
+        // OPTIMIZATION: Only sort when camera view has changed significantly
+        guard needsSorting else {
+            return
+        }
+        
+        let startTime = CACurrentMediaTime()
+        
+        // Sort splats by depth (front-to-back) - SINGLE SORTING LOCATION
+        let indexedDepths = splats.enumerated().map { (index, splat) -> (Int, Float) in
+            return (index, splat.depth)
+        }
+        
+        // Sort by depth: smaller depth = closer = front-to-back
+        let sorted = indexedDepths.sorted { $0.1 < $1.1 }
         let sortedIndices = sorted.map { UInt32($0.0) }
         
         lastCPUSortTime = CACurrentMediaTime() - startTime
         
-        // Put CPU-sorted indices into the ORIGINAL sortedIndicesBuffer
+        // Put depth-sorted indices into sortedIndicesBuffer
         let bufferPointer = sortedIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: splats.count)
         for (index, splatIndex) in sortedIndices.enumerated() {
             bufferPointer[index] = splatIndex
         }
+        
+        needsSorting = false  // Reset flag after sorting
+        
+        // Debug: Show depth range after sorting
+        let firstDepth = splats[Int(sortedIndices[0])].depth
+        let lastDepth = splats[Int(sortedIndices[sortedIndices.count-1])].depth
+        print("🔄 CPU Sort: Sorted \(splats.count) splats by depth (front→back) in \(String(format: "%.2f", lastCPUSortTime * 1000))ms")
+        print("   Depth range: \(String(format: "%.2f", firstDepth)) (front) → \(String(format: "%.2f", lastDepth)) (back)")
     }
     
 
@@ -1233,11 +1303,11 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
         let drawableSize = view.drawableSize
         let aspect = Float(drawableSize.width / drawableSize.height)
         
-        // OPTIMIZATION: Compute matrices once and pass to updateCamera  
+        // OPTIMIZATION: Update camera first, then compute matrices with new position  
+        updateCamera(time: time)
         let viewMatrix = createViewMatrix()
         let projectionMatrix = createProjectionMatrix(aspect: aspect)
         let viewProjectionMatrix = projectionMatrix * viewMatrix
-        updateCamera(time: time, viewMatrix: viewMatrix)
 
         let viewUniforms = ViewUniforms(
             viewMatrix: viewMatrix,
@@ -1723,9 +1793,11 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
     private func renderWithHybridPipeline(commandBuffer: MTLCommandBuffer) {
         let pipelineStartTime = CACurrentMediaTime()
         
-        // PHASE 1: CPU Sort DISABLED for debugging
-        // performCPUSort()
-        print("🚫 SORTING DISABLED - Using original splat order")
+        // PHASE 1: GPU Frustum Culling (identify visible splats first)
+        performFrustumCulling(commandBuffer: commandBuffer)
+        
+        // PHASE 2: CPU Depth Calculation (ONLY for visible splats) + Sorting  
+        performOptimizedDepthCalculationAndSort()
         
         // PHASE 2: Preprocess Splats (with LOD optimization)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
@@ -1742,7 +1814,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             computeEncoder.endEncoding()
         }
 
-        // PHASE 3: Clear Tiles
+        // PHASE 4: Clear Tiles
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
             computeEncoder.setComputePipelineState(clearTilesPipeline)
             computeEncoder.setBuffer(tileBuffer, offset: 0, index: 0)
@@ -1760,7 +1832,7 @@ class TiledSplatRenderer: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate
             computeEncoder.endEncoding()
         }
 
-        // PHASE 4: Build Tiles (using BASIC shader - no sorting yet)
+        // PHASE 5: Build Tiles (using BASIC shader - no sorting yet)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
             computeEncoder.setComputePipelineState(buildTilesPipeline)
             computeEncoder.setBuffer(splatBuffer, offset: 0, index: 0)
@@ -2064,7 +2136,7 @@ extension TiledSplatRenderer {
             }
             
             // 🎯 LIMIT TO FIRST 10,000 SPLATS
-            let maxSplats = 40000
+            let maxSplats = 1000
             if loadedSplats.count > maxSplats {
                 loadedSplats = Array(loadedSplats.prefix(maxSplats))
                 print("⚠️ Limited to first \(maxSplats) splats (original: \(parseResult.splats.count))")
